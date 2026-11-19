@@ -192,10 +192,10 @@ index b330096..c3cdc35 100644
              default: return 300;
 diff --git a/games/totk/android/java/com/aure/totk/setup/GameReport.java b/games/totk/android/java/com/aure/totk/setup/GameReport.java
 new file mode 100644
-index 0000000..802059e
+index 0000000..2f2ac73
 --- /dev/null
 +++ b/games/totk/android/java/com/aure/totk/setup/GameReport.java
-@@ -0,0 +1,101 @@
+@@ -0,0 +1,120 @@
 +package com.aure.totk.setup;
 +
 +import android.app.ActivityManager;
@@ -243,6 +243,7 @@ index 0000000..802059e
 +        try { game = StorageLocation.gameDir(context); } catch (RuntimeException failed) { game = null; }
 +        File totkEnv = game == null ? null : new File(game, "totk.env");
 +        if (totkEnv != null && totkEnv.isFile()) out.append("\n== totk.env (developer overrides) ==\n").append(tail(totkEnv, 8 * 1024));
++        if (game != null) out.append("\n== Memory lines from the whole session (last 40) ==\n").append(memoryLines(new File(game, "totk.log")));
 +        out.append("\n== totk.log (last ").append(LOG_TAIL_BYTES / 1024).append(" KiB of the last game session) ==\n");
 +        out.append(game == null ? "(game folder unknown)\n" : tail(new File(game, "totk.log"), LOG_TAIL_BYTES));
 +        return out.toString();
@@ -283,6 +284,24 @@ index 0000000..802059e
 +            default: return "UNKNOWN";
 +        }
 +    }
++    /** The RAM saver's marks and the backend's memory reports from anywhere in the log, so a short tail still has them. */
++    private static String memoryLines(File log) {
++        java.util.ArrayDeque<String> keep = new java.util.ArrayDeque<>();
++        try (java.io.BufferedReader in = new java.io.BufferedReader(new java.io.FileReader(log))) {
++            for (String line; (line = in.readLine()) != null; ) {
++                if (line.contains("mark mem") || line.contains("mark ram-saver") || line.startsWith("[nvn-vk] memory")
++                        || line.contains("descriptors frame") || line.contains("recorder storage:")) {
++                    if (keep.size() == 40) keep.removeFirst();
++                    keep.addLast(line);
++                }
++            }
++        } catch (IOException missing) {
++            return "(" + missing.getMessage() + ")\n";
++        }
++        StringBuilder out = new StringBuilder();
++        for (String line : keep) out.append(line).append('\n');
++        return keep.isEmpty() ? "(none)\n" : out.toString();
++    }
 +    /** The last max bytes of a file as text, starting at a line boundary. */
 +    private static String tail(File file, int max) {
 +        try (RandomAccessFile in = new RandomAccessFile(file, "r")) {
@@ -298,7 +317,7 @@ index 0000000..802059e
 +    }
 +}
 diff --git a/games/totk/android/java/com/aure/totk/setup/Settings.java b/games/totk/android/java/com/aure/totk/setup/Settings.java
-index 98f533d..c436b19 100644
+index 98f533d..fab5d7a 100644
 --- a/games/totk/android/java/com/aure/totk/setup/Settings.java
 +++ b/games/totk/android/java/com/aure/totk/setup/Settings.java
 @@ -50,2 +50,3 @@ final class Settings {
@@ -322,7 +341,7 @@ index 98f533d..c436b19 100644
          if (tab.equals(PERFORMANCE)) values.put("gpu_feed", gpuFeedDefault(soc));
 +        if (tab.equals(SCREEN)) values.put("ram_saver", ramSaverDefault(soc));
      }
-@@ -267,2 +276,16 @@ final class Settings {
+@@ -267,2 +276,18 @@ final class Settings {
          line(out, "TOTK_COMPANION=" + (get("second_screen").equals("on") ? "1" : "0"));
 +        // RAM saver: caps only the app's own caches (texture-upload staging, preloaded shaders); the game's memory pool
 +        // is never reduced. TOTK_RAM_SAVER is read by RamGuard in the game process (live trims under memory pressure).
@@ -335,6 +354,8 @@ index 98f533d..c436b19 100644
 +                line(out, "TOTK_ROMFS_MMAP=0");
 +                // No background replay of the whole pipeline list: only the pipelines a scene needs are built and kept.
 +                line(out, "TOTK_PSO_PREWARM=0");
++                // Recorder slabs: keep 16 MiB of idle capacity instead of 64 (the backend's floor).
++                line(out, "TOTK_VK_REC_MEMORY_MB=16");
 +                break;
 +            default: break;
 +        }
@@ -415,23 +436,25 @@ index 6ce0578..0072fb7 100644
 +                    + "on its own. The game's own memory is never reduced. May add short stutters the first time new areas load.";
              case "second_screen": return "On handhelds with a second display, shows the map, inventory and shortcuts on it while you "
 diff --git a/games/totk/runtime/frontend_android.c b/games/totk/runtime/frontend_android.c
-index ce1efe5..696d84d 100644
+index ce1efe5..c16f42a 100644
 --- a/games/totk/runtime/frontend_android.c
 +++ b/games/totk/runtime/frontend_android.c
-@@ -1268,2 +1268,4 @@ static const char *const settings_keys[] = {
+@@ -1268,2 +1268,5 @@ static const char *const settings_keys[] = {
      "TOTK_DATA_DIR",
 +    /* RAM saver (S23 fork): host-side caches only; the game's own 3.2 GiB pool is never reduced. */
 +    "TOTK_RAM_SAVER", "TOTK_VK_STAGING_RETAIN_MB", "TOTK_SEED_WARM_MB", "TOTK_ROMFS_MMAP", "TOTK_PSO_PREWARM",
++    "TOTK_VK_REC_MEMORY_MB",
  };
 diff --git a/tests/test_android_settings.py b/tests/test_android_settings.py
-index 006c426..0aaa0fa 100644
+index 006c426..46b0fea 100644
 --- a/tests/test_android_settings.py
 +++ b/tests/test_android_settings.py
-@@ -23,4 +23,12 @@ ALLOWED = {'TOTK_FPS60', 'TOTK_GPU_TIME', 'TOTK_FRAMEGEN', 'TOTK_REALTIME', 'TOT
+@@ -23,4 +23,13 @@ ALLOWED = {'TOTK_FPS60', 'TOTK_GPU_TIME', 'TOTK_FRAMEGEN', 'TOTK_REALTIME', 'TOT
             'TOTK_AUTOLOAD', 'TOTK_VK_SPLIT_PASS_DRAWS', 'TOTK_ADPF_GPU', 'TOTK_FPS60_HYSTERESIS',
 -           'TOTK_UNCAPPED', 'TOTK_UNCAPPED_HZ', 'TOTK_UNCAPPED_INTERVAL', 'TOTK_FRAME_RATE_HINT', 'TOTK_FRAME_RATE_HINT_HZ'}
 +           'TOTK_UNCAPPED', 'TOTK_UNCAPPED_HZ', 'TOTK_UNCAPPED_INTERVAL', 'TOTK_FRAME_RATE_HINT', 'TOTK_FRAME_RATE_HINT_HZ',
-+           'TOTK_RAM_SAVER', 'TOTK_VK_STAGING_RETAIN_MB', 'TOTK_SEED_WARM_MB', 'TOTK_ROMFS_MMAP', 'TOTK_PSO_PREWARM'}
++           'TOTK_RAM_SAVER', 'TOTK_VK_STAGING_RETAIN_MB', 'TOTK_SEED_WARM_MB', 'TOTK_ROMFS_MMAP', 'TOTK_PSO_PREWARM',
++           'TOTK_VK_REC_MEMORY_MB'}
  FRONTEND = TOTK / 'runtime/frontend_android.c'
 +
 +
@@ -441,12 +464,12 @@ index 006c426..0aaa0fa 100644
 +        return env
 +    return env.replace('TOTK_COMPANION=1\n', 'TOTK_COMPANION=1\nTOTK_RAM_SAVER=on\nTOTK_VK_STAGING_RETAIN_MB=96\nTOTK_SEED_WARM_MB=48\n')
  FRAMEGEN = ['TOTK_FPS60=0', 'TOTK_FRAMEGEN=locked', 'TOTK_REALTIME=1', 'TOTK_FRAME_LAG=0', 'TOTK_FPS_AUTO=0', 'DM_PRESENT_HZ=60',
-@@ -224,3 +232,3 @@ class SettingsTests(unittest.TestCase):
+@@ -224,3 +233,3 @@ class SettingsTests(unittest.TestCase):
                  for soc in ('QCS8550', 'QCM8550', 'SM8550', 'CQ7790S', 'CQ7790M', 'SM7750', 'unknown', 'SM8650', 'XSM8750', 'CQ8725SA'):
 -                    self.assertEqual(self.run_probe(f'envsocpreset {preset} {soc} en-GB')[0].replace('|', '\n'), before)
 +                    self.assertEqual(self.run_probe(f'envsocpreset {preset} {soc} en-GB')[0].replace('|', '\n'), with_ram_saver(before, soc))
                  for feed in ('off', 'on'):
-@@ -263,2 +271,13 @@ class SettingsTests(unittest.TestCase):
+@@ -263,2 +272,13 @@ class SettingsTests(unittest.TestCase):
  
 +    def test_ram_saver_levels(self):
 +        self.assertFalse(any('RAM' in l or 'SEED' in l for l in self.env(soc='QCS8550')))
@@ -454,13 +477,13 @@ index 006c426..0aaa0fa 100644
 +        on = self.env(ram_saver='on')
 +        self.assertIn('TOTK_RAM_SAVER=on', on); self.assertIn('TOTK_VK_STAGING_RETAIN_MB=96', on); self.assertIn('TOTK_SEED_WARM_MB=48', on)
 +        mx = self.env(ram_saver='max')
-+        for line in ('TOTK_RAM_SAVER=max', 'TOTK_VK_STAGING_RETAIN_MB=32', 'TOTK_SEED_WARM_MB=16', 'TOTK_ROMFS_MMAP=0', 'TOTK_PSO_PREWARM=0'):
++        for line in ('TOTK_RAM_SAVER=max', 'TOTK_VK_STAGING_RETAIN_MB=32', 'TOTK_SEED_WARM_MB=16', 'TOTK_ROMFS_MMAP=0', 'TOTK_PSO_PREWARM=0', 'TOTK_VK_REC_MEMORY_MB=16'):
 +            self.assertIn(line, mx)
 +        self.assertIn('TOTK_RAM_SAVER=on', self.env(soc='SM8550'))
 +        self.assertNotIn('TOTK_RAM_SAVER=on', self.env(soc='SM8550', ram_saver='off'))
 +
      def test_frame_lag_only_adds_one_line_to_odin_native_sixty_bytes(self):
-@@ -291,3 +310,3 @@ class SettingsTests(unittest.TestCase):
+@@ -291,3 +311,3 @@ class SettingsTests(unittest.TestCase):
                              actual = self.run_probe(f'envsoc {soc} en-GB frame_rate={rate} frame_gen={framegen} gpu_feed={feed}')[0].replace('|', '\n')
 -                            self.assertEqual(actual.encode(), expected.encode())
 +                            self.assertEqual(actual.encode(), with_ram_saver(expected, soc).encode())
