@@ -1,9 +1,9 @@
 diff --git a/games/totk/android/java/com/aure/totk/RamGuard.java b/games/totk/android/java/com/aure/totk/RamGuard.java
 new file mode 100644
-index 0000000..4933f78
+index 0000000..7530bcf
 --- /dev/null
 +++ b/games/totk/android/java/com/aure/totk/RamGuard.java
-@@ -0,0 +1,110 @@
+@@ -0,0 +1,112 @@
 +package com.aure.totk;
 +
 +import android.app.ActivityManager;
@@ -80,7 +80,8 @@ index 0000000..4933f78
 +            boolean tight = info.lowMemory || info.availMem < info.threshold + margin;
 +            boolean comfortable = info.availMem > info.threshold + 2 * margin;
 +            if (tight && !trimmed) {
-+                if (write("set TOTK_VK_STAGING_RETAIN_MB=8\n")) {
++                if (write("mark ram-saver: free " + info.availMem / MIB + " MiB, threshold " + info.threshold / MIB
++                        + " MiB, low " + info.lowMemory + "\nset TOTK_VK_STAGING_RETAIN_MB=8\n")) {
 +                    trimmed = true;
 +                    Log.i(TAG, "free RAM " + info.availMem / MIB + " MiB (threshold " + info.threshold / MIB + "): staging trimmed");
 +                }
@@ -88,7 +89,8 @@ index 0000000..4933f78
 +            } else if (trimmed) {
 +                if (!comfortable) calmSince = 0;
 +                else if (calmSince == 0) calmSince = now;
-+                else if (now - calmSince >= CALM_MS && write("unset TOTK_VK_STAGING_RETAIN_MB\n")) {
++                else if (now - calmSince >= CALM_MS && write("mark ram-saver: free " + info.availMem / MIB
++                        + " MiB again\nunset TOTK_VK_STAGING_RETAIN_MB\n")) {
 +                    trimmed = false; calmSince = 0;
 +                    Log.i(TAG, "free RAM " + info.availMem / MIB + " MiB: staging back to its launch value");
 +                }
@@ -140,6 +142,113 @@ index b330096..c3cdc35 100644
 -            case "gpu_feed": case "rumble": case "motion": return 0;   // text and facts only
 +            case "gpu_feed": case "rumble": case "motion": case "ram_saver": return 0;   // text and facts only
              default: return 300;
+diff --git a/games/totk/android/java/com/aure/totk/setup/GameReport.java b/games/totk/android/java/com/aure/totk/setup/GameReport.java
+new file mode 100644
+index 0000000..802059e
+--- /dev/null
++++ b/games/totk/android/java/com/aure/totk/setup/GameReport.java
+@@ -0,0 +1,101 @@
++package com.aure.totk.setup;
++
++import android.app.ActivityManager;
++import android.app.ApplicationExitInfo;
++import android.content.Context;
++import android.os.Build;
++import java.io.File;
++import java.io.IOException;
++import java.io.RandomAccessFile;
++import java.nio.charset.StandardCharsets;
++import java.text.SimpleDateFormat;
++import java.util.Date;
++import java.util.List;
++import java.util.Locale;
++
++/** About → Share game log (S23 fork): a plain-text report for a bug report, without root. It holds why Android ended
++ * the app's last processes (ApplicationExitInfo: low memory, native crash, killed...), the device and its memory, the
++ * menu's settings.env and the end of <game>/totk.log, the log of the last game session (the next game start
++ * overwrites it). No game files, keys or saves are read. */
++final class GameReport {
++    private GameReport() { }
++    /** The end of totk.log kept in the report: share sheets and chat apps refuse very long text. */
++    private static final int LOG_TAIL_BYTES = 48 * 1024;
++
++    static String build(Context context, String appVersion) {
++        StringBuilder out = new StringBuilder();
++        out.append("TotK Native game report\n");
++        out.append("App: ").append(appVersion).append('\n');
++        out.append("Device: ").append(Build.MANUFACTURER).append(' ').append(Build.MODEL).append(" (").append(Build.DEVICE)
++                .append("), SoC ").append(Build.SOC_MODEL).append(", Android ").append(Build.VERSION.RELEASE)
++                .append(" (API ").append(Build.VERSION.SDK_INT).append(")\n");
++        ActivityManager am = context.getSystemService(ActivityManager.class);
++        if (am != null) {
++            ActivityManager.MemoryInfo mem = new ActivityManager.MemoryInfo();
++            am.getMemoryInfo(mem);
++            out.append("Memory now: total ").append(mem.totalMem >> 20).append(" MiB, available ").append(mem.availMem >> 20)
++                    .append(" MiB, low-memory threshold ").append(mem.threshold >> 20).append(" MiB, low ").append(mem.lowMemory)
++                    .append('\n');
++            out.append("\n== Why Android ended the last processes (newest first) ==\n");
++            exits(out, am, context.getPackageName());
++        }
++        out.append("\n== settings.env ==\n");
++        out.append(tail(new File(context.getFilesDir(), "settings.env"), 8 * 1024));
++        File game;
++        try { game = StorageLocation.gameDir(context); } catch (RuntimeException failed) { game = null; }
++        File totkEnv = game == null ? null : new File(game, "totk.env");
++        if (totkEnv != null && totkEnv.isFile()) out.append("\n== totk.env (developer overrides) ==\n").append(tail(totkEnv, 8 * 1024));
++        out.append("\n== totk.log (last ").append(LOG_TAIL_BYTES / 1024).append(" KiB of the last game session) ==\n");
++        out.append(game == null ? "(game folder unknown)\n" : tail(new File(game, "totk.log"), LOG_TAIL_BYTES));
++        return out.toString();
++    }
++
++    private static void exits(StringBuilder out, ActivityManager am, String pkg) {
++        List<ApplicationExitInfo> list;
++        try { list = am.getHistoricalProcessExitReasons(pkg, 0, 6); }
++        catch (RuntimeException failed) { out.append("(not available: ").append(failed.getMessage()).append(")\n"); return; }
++        if (list.isEmpty()) { out.append("(none recorded)\n"); return; }
++        SimpleDateFormat time = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.ROOT);
++        for (ApplicationExitInfo e : list) {
++            out.append(time.format(new Date(e.getTimestamp()))).append("  ").append(e.getProcessName())
++                    .append("  reason ").append(reason(e.getReason())).append(" (").append(e.getReason()).append(')')
++                    .append(", status ").append(e.getStatus())
++                    .append(", importance ").append(e.getImportance())
++                    .append(", pss ").append(e.getPss() >> 10).append(" MiB, rss ").append(e.getRss() >> 10).append(" MiB");
++            if (e.getDescription() != null) out.append(", \"").append(e.getDescription()).append('"');
++            out.append('\n');
++        }
++    }
++    private static String reason(int r) {
++        switch (r) {
++            case ApplicationExitInfo.REASON_EXIT_SELF: return "EXIT_SELF";
++            case ApplicationExitInfo.REASON_SIGNALED: return "SIGNALED";
++            case ApplicationExitInfo.REASON_LOW_MEMORY: return "LOW_MEMORY";
++            case ApplicationExitInfo.REASON_CRASH: return "CRASH";
++            case ApplicationExitInfo.REASON_CRASH_NATIVE: return "CRASH_NATIVE";
++            case ApplicationExitInfo.REASON_ANR: return "ANR";
++            case ApplicationExitInfo.REASON_INITIALIZATION_FAILURE: return "INITIALIZATION_FAILURE";
++            case ApplicationExitInfo.REASON_PERMISSION_CHANGE: return "PERMISSION_CHANGE";
++            case ApplicationExitInfo.REASON_EXCESSIVE_RESOURCE_USAGE: return "EXCESSIVE_RESOURCE_USAGE";
++            case ApplicationExitInfo.REASON_USER_REQUESTED: return "USER_REQUESTED";
++            case ApplicationExitInfo.REASON_USER_STOPPED: return "USER_STOPPED";
++            case ApplicationExitInfo.REASON_DEPENDENCY_DIED: return "DEPENDENCY_DIED";
++            case ApplicationExitInfo.REASON_OTHER: return "OTHER";
++            case ApplicationExitInfo.REASON_FREEZER: return "FREEZER";
++            default: return "UNKNOWN";
++        }
++    }
++    /** The last max bytes of a file as text, starting at a line boundary. */
++    private static String tail(File file, int max) {
++        try (RandomAccessFile in = new RandomAccessFile(file, "r")) {
++            long length = in.length(), from = Math.max(0, length - max);
++            byte[] bytes = new byte[(int) (length - from)];
++            in.seek(from); in.readFully(bytes);
++            String text = new String(bytes, StandardCharsets.UTF_8);
++            if (from > 0) { int nl = text.indexOf('\n'); if (nl >= 0) text = text.substring(nl + 1); }
++            return (from > 0 ? "(… " + (from >> 10) + " KiB earlier omitted)\n" : "") + text + (text.endsWith("\n") ? "" : "\n");
++        } catch (IOException missing) {
++            return "(" + file.getName() + ": " + missing.getMessage() + ")\n";
++        }
++    }
++}
 diff --git a/games/totk/android/java/com/aure/totk/setup/Settings.java b/games/totk/android/java/com/aure/totk/setup/Settings.java
 index 98f533d..824cffc 100644
 --- a/games/totk/android/java/com/aure/totk/setup/Settings.java
@@ -181,7 +290,7 @@ index 98f533d..824cffc 100644
 +        }
          line(out, "TOTK_FACE_BUTTONS=" + (get("buttons").equals("xbox") ? "position" : "label"));
 diff --git a/games/totk/android/java/com/aure/totk/setup/SetupActivity.java b/games/totk/android/java/com/aure/totk/setup/SetupActivity.java
-index c8e30d3..b3c9b5f 100644
+index c8e30d3..64a7b97 100644
 --- a/games/totk/android/java/com/aure/totk/setup/SetupActivity.java
 +++ b/games/totk/android/java/com/aure/totk/setup/SetupActivity.java
 @@ -1268,2 +1268,3 @@ public final class SetupActivity extends Activity implements SetupService.Listen
@@ -194,6 +303,48 @@ index c8e30d3..b3c9b5f 100644
 +                    fact(Strings.APPLIES, Strings.WHEN_STARTS);
 +                    break;
                  case "audio_latency":
+@@ -2371,2 +2375,5 @@ public final class SetupActivity extends Activity implements SetupService.Listen
+         Widgets.Row updateRow = updateSwitch(list);
++        // S23 fork: the last game session's log and Android's exit reasons, shared as text (no root needed).
++        Widgets.Row logRow = listRow(list, "about:gamelog", "Share game log", "Why the game closed · for a bug report", 92, 18);
++        logRow.setOnClickListener(v -> shareGameLog(version));
+         detailPanel();
+@@ -2389,2 +2396,7 @@ public final class SetupActivity extends Activity implements SetupService.Listen
+                 detailTitle.setText(Strings.UPDATES); detailText.setText(Strings.UPDATE_PRIVACY);
++            } else if (v == logRow) {
++                detailTitle.setText("Share game log");
++                detailText.setText("Shares, as text, why Android ended the game's last processes (low memory, crash, ...), the "
++                        + "device's memory, the menu settings and the end of the last game session's log. Share it before "
++                        + "starting the game again: the next start overwrites the log. No game files, keys or saves are included.");
+             } else {
+@@ -2396,3 +2408,3 @@ public final class SetupActivity extends Activity implements SetupService.Listen
+         versionRow.setOnFocusChangeListener(detail); licencesRow.setOnFocusChangeListener(detail); project.setOnFocusChangeListener(detail);
+-        updateRow.setOnFocusChangeListener(detail);
++        updateRow.setOnFocusChangeListener(detail); logRow.setOnFocusChangeListener(detail);
+         primary = versionRow;
+@@ -2401,2 +2413,22 @@ public final class SetupActivity extends Activity implements SetupService.Listen
+ 
++    private boolean sharingGameLog;
++    private void shareGameLog(String version) {
++        if (sharingGameLog) return;
++        sharingGameLog = true;
++        new Thread(() -> {
++            String report;
++            try { report = GameReport.build(this, version); }
++            catch (RuntimeException failed) { report = "TotK Native game report failed: " + failed; }
++            String text = report;
++            runOnUiThread(() -> {
++                sharingGameLog = false;
++                if (isDestroyed()) return;
++                Intent send = new Intent(Intent.ACTION_SEND).setType("text/plain")
++                        .putExtra(Intent.EXTRA_SUBJECT, "TotK Native game log").putExtra(Intent.EXTRA_TEXT, text);
++                try { startActivity(Intent.createChooser(send, "Share game log")); }
++                catch (ActivityNotFoundException unavailable) { showNote(Strings.SHARE_DETAILS_MISSING); }
++            });
++        }, "totk-gamelog").start();
++    }
++
+     /** The source commit this APK was built from: assets/build.txt ("commit <hash>", written by build_release.py). */
 diff --git a/games/totk/android/java/com/aure/totk/setup/Strings.java b/games/totk/android/java/com/aure/totk/setup/Strings.java
 index 6ce0578..cc18dc6 100644
 --- a/games/totk/android/java/com/aure/totk/setup/Strings.java
