@@ -1,0 +1,152 @@
+name: Build APK (S23 RAM saver)
+
+# Builds the TotK Native APK of this fork in the cloud and publishes it as a pre-release, so it can be downloaded
+# straight from a phone. No game file, key or anything derived from them is read or packed (the build audits the APK).
+on:
+  push:
+    branches: [main, s23-ram-saver]
+    paths: ['s23-ram-saver.patch', '.github/workflows/build-apk.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-apk
+  cancel-in-progress: true
+
+jobs:
+  apk:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    env:
+      NDK_VERSION: 28.2.13676358
+      KEY_PASS: ${{ secrets.SIGNING_KEY_PASS || 'totk-s23-local-key' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+
+      - name: Apply the RAM saver changes (s23-ram-saver.patch) and check them
+        run: |
+          git apply --whitespace=nowarn s23-ram-saver.patch
+          git status --short
+          python -m unittest tests.test_android_settings
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Host tools
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q clang zlib1g-dev ninja-build pkg-config bison flex m4 glslang-tools unzip
+          python -m pip install -q -r games/totk/requirements.txt
+
+      - name: Android NDK r28c
+        run: |
+          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKM" --licenses > /dev/null || true
+          "$SDKM" --install "ndk;$NDK_VERSION" "platforms;android-35" "build-tools;35.0.0" > /dev/null
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
+
+      - name: Turnip driver (from the official release APK, else built from the pinned recipe)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          PIN=$(grep -oE 'SHA-256 `[0-9a-f]{64}`' games/totk/android/turnip/README.md | head -1 | grep -oE '[0-9a-f]{64}')
+          mkdir -p "$RUNNER_TEMP/upstream" && cd "$RUNNER_TEMP/upstream"
+          URL=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" https://api.github.com/repos/AurelioB/totk-android/releases/latest \
+                | python -c 'import json,sys; print(next(a["browser_download_url"] for a in json.load(sys.stdin)["assets"] if a["name"].endswith(".apk")))') || URL=
+          OK=0
+          if [ -n "$URL" ] && curl -fsSL -o official.apk "$URL"; then
+            unzip -o -q official.apk 'lib/arm64-v8a/libtotk_turnip.so' || true
+            if [ -f lib/arm64-v8a/libtotk_turnip.so ] && [ "$(sha256sum lib/arm64-v8a/libtotk_turnip.so | cut -d' ' -f1)" = "$PIN" ]; then
+              cp lib/arm64-v8a/libtotk_turnip.so "$RUNNER_TEMP/driver.so"; OK=1
+              echo "Turnip taken from $URL"
+            fi
+          fi
+          if [ "$OK" = 0 ]; then
+            echo "Release Turnip missing or not the pinned one: building it from the recipe"
+            cd "$GITHUB_WORKSPACE"
+            TURNIP_VARIANTS=release games/totk/android/turnip/build.sh
+            cp games/totk/build/turnip/packages/release/driver.so "$RUNNER_TEMP/driver.so"
+          fi
+          echo "TURNIP=$RUNNER_TEMP/driver.so" >> "$GITHUB_ENV"
+
+      - name: Cached signing key (kept between builds so updates install over the previous one)
+        uses: actions/cache@v4
+        with:
+          path: ~/.totk-key
+          key: totk-s23-signing-key-v1
+
+      - name: Signing key
+        env:
+          SIGNING_KEY_P12: ${{ secrets.SIGNING_KEY_P12 }}
+        run: |
+          set -eu
+          mkdir -p "$HOME/.totk-key"
+          if [ -n "$SIGNING_KEY_P12" ]; then
+            echo "$SIGNING_KEY_P12" | base64 -d > "$HOME/.totk-key/key.p12"
+            echo "Using the SIGNING_KEY_P12 secret"
+          fi
+
+      - name: Make a signing key if there is none
+        run: |
+          set -eu
+          K="$HOME/.totk-key/key.p12"
+          if [ ! -s "$K" ]; then
+            openssl req -x509 -newkey rsa:4096 -nodes -keyout "$RUNNER_TEMP/k.pem" -out "$RUNNER_TEMP/c.pem" -days 10000 \
+              -subj "/CN=TotK Native S23 fork" 2> /dev/null
+            openssl pkcs12 -export -inkey "$RUNNER_TEMP/k.pem" -in "$RUNNER_TEMP/c.pem" -out "$K" -passout env:KEY_PASS
+            rm -f "$RUNNER_TEMP/k.pem"
+            echo "::warning::A new signing key was made. Keep building at least once a week (or add the SIGNING_KEY_P12 secret), otherwise a later APK cannot update this one."
+          fi
+          openssl pkcs12 -in "$K" -nokeys -passin env:KEY_PASS 2> /dev/null | openssl x509 -noout -fingerprint -sha256
+
+      - name: Build the APK
+        run: |
+          set -eu
+          BASE=$(python -c "import re,pathlib;print(re.search(r\"APP_VERSION = '([0-9.]+)'\", pathlib.Path('games/totk/android/build_release.py').read_text()).group(1))")
+          # A name with '-' turns off the official update prompt (it would offer a differently signed APK).
+          NAME="$BASE-s23.${{ github.run_number }}"
+          CODE=$(python -c "a,b,c='$BASE'.split('.'); print((int(a)*10000+int(b)*100+int(c))*1000 + ${{ github.run_number }} % 1000)")
+          python games/totk/android/build_release.py --ndk "$ANDROID_NDK_HOME" --turnip "$TURNIP" \
+            --key "$HOME/.totk-key/key.p12" --key-pass-env KEY_PASS --android-sdk "$ANDROID_HOME" \
+            --version-name "$NAME" --version-code "$CODE" -o "$RUNNER_TEMP/TotK-Native-$NAME.apk"
+          echo "APK=$RUNNER_TEMP/TotK-Native-$NAME.apk" >> "$GITHUB_ENV"
+          echo "NAME=$NAME" >> "$GITHUB_ENV"
+
+      - name: APK as a workflow artifact too
+        uses: actions/upload-artifact@v4
+        with:
+          name: TotK-Native-${{ env.NAME }}
+          path: ${{ env.APK }}
+
+      - name: Build logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: games/totk/build/release/logs/
+          if-no-files-found: ignore
+
+      - name: Publish the APK (pre-release, downloadable from the phone)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          sha256sum "$APK" | sed "s#  .*/#  #" > "$APK.sha256"
+          gh release create "s23-build-${{ github.run_number }}" "$APK" "$APK.sha256" --prerelease --target "$GITHUB_SHA" \
+            --title "TotK Native S23 · RAM saver · build ${{ github.run_number }}" \
+            --notes "Built from $GITHUB_SHA. Graphics → Screen → RAM saver (On by default on Snapdragon 8 Gen 2 phones). Contains no game files."
