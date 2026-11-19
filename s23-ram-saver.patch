@@ -250,7 +250,7 @@ index 0000000..802059e
 +    }
 +}
 diff --git a/games/totk/android/java/com/aure/totk/setup/Settings.java b/games/totk/android/java/com/aure/totk/setup/Settings.java
-index 98f533d..824cffc 100644
+index 98f533d..c436b19 100644
 --- a/games/totk/android/java/com/aure/totk/setup/Settings.java
 +++ b/games/totk/android/java/com/aure/totk/setup/Settings.java
 @@ -50,2 +50,3 @@ final class Settings {
@@ -274,7 +274,7 @@ index 98f533d..824cffc 100644
          if (tab.equals(PERFORMANCE)) values.put("gpu_feed", gpuFeedDefault(soc));
 +        if (tab.equals(SCREEN)) values.put("ram_saver", ramSaverDefault(soc));
      }
-@@ -267,2 +276,14 @@ final class Settings {
+@@ -267,2 +276,16 @@ final class Settings {
          line(out, "TOTK_COMPANION=" + (get("second_screen").equals("on") ? "1" : "0"));
 +        // RAM saver: caps only the app's own caches (texture-upload staging, preloaded shaders); the game's memory pool
 +        // is never reduced. TOTK_RAM_SAVER is read by RamGuard in the game process (live trims under memory pressure).
@@ -285,6 +285,8 @@ index 98f533d..824cffc 100644
 +            case "max":
 +                line(out, "TOTK_RAM_SAVER=max"); line(out, "TOTK_VK_STAGING_RETAIN_MB=32"); line(out, "TOTK_SEED_WARM_MB=16");
 +                line(out, "TOTK_ROMFS_MMAP=0");
++                // No background replay of the whole pipeline list: only the pipelines a scene needs are built and kept.
++                line(out, "TOTK_PSO_PREWARM=0");
 +                break;
 +            default: break;
 +        }
@@ -346,7 +348,7 @@ index c8e30d3..64a7b97 100644
 +
      /** The source commit this APK was built from: assets/build.txt ("commit <hash>", written by build_release.py). */
 diff --git a/games/totk/android/java/com/aure/totk/setup/Strings.java b/games/totk/android/java/com/aure/totk/setup/Strings.java
-index 6ce0578..cc18dc6 100644
+index 6ce0578..0072fb7 100644
 --- a/games/totk/android/java/com/aure/totk/setup/Strings.java
 +++ b/games/totk/android/java/com/aure/totk/setup/Strings.java
 @@ -143,2 +143,3 @@ final class Strings {
@@ -360,28 +362,28 @@ index 6ce0578..cc18dc6 100644
 @@ -207,2 +209,6 @@ final class Strings {
              case "overlay_pos": return "Which corner of the screen the performance overlay sits in.";
 +            case "ram_saver": return "Keeps the app's own caches small so Android is less likely to close the game or the apps "
-+                    + "behind it. On caps texture-upload staging and preloaded shaders; Max caps them harder and reads the game "
-+                    + "image from storage instead of mapping it. While playing, if free RAM runs low, staging is trimmed further "
++                    + "behind it. On caps texture-upload staging and preloaded shaders; Max caps them harder, reads the game "
++                    + "image from storage instead of mapping it and builds only the shaders a scene needs. While playing, if free RAM runs low, staging is trimmed further "
 +                    + "on its own. The game's own memory is never reduced. May add short stutters the first time new areas load.";
              case "second_screen": return "On handhelds with a second display, shows the map, inventory and shortcuts on it while you "
 diff --git a/games/totk/runtime/frontend_android.c b/games/totk/runtime/frontend_android.c
-index ce1efe5..99721b3 100644
+index ce1efe5..696d84d 100644
 --- a/games/totk/runtime/frontend_android.c
 +++ b/games/totk/runtime/frontend_android.c
 @@ -1268,2 +1268,4 @@ static const char *const settings_keys[] = {
      "TOTK_DATA_DIR",
 +    /* RAM saver (S23 fork): host-side caches only; the game's own 3.2 GiB pool is never reduced. */
-+    "TOTK_RAM_SAVER", "TOTK_VK_STAGING_RETAIN_MB", "TOTK_SEED_WARM_MB", "TOTK_ROMFS_MMAP",
++    "TOTK_RAM_SAVER", "TOTK_VK_STAGING_RETAIN_MB", "TOTK_SEED_WARM_MB", "TOTK_ROMFS_MMAP", "TOTK_PSO_PREWARM",
  };
 diff --git a/tests/test_android_settings.py b/tests/test_android_settings.py
-index 006c426..e84293a 100644
+index 006c426..0aaa0fa 100644
 --- a/tests/test_android_settings.py
 +++ b/tests/test_android_settings.py
 @@ -23,4 +23,12 @@ ALLOWED = {'TOTK_FPS60', 'TOTK_GPU_TIME', 'TOTK_FRAMEGEN', 'TOTK_REALTIME', 'TOT
             'TOTK_AUTOLOAD', 'TOTK_VK_SPLIT_PASS_DRAWS', 'TOTK_ADPF_GPU', 'TOTK_FPS60_HYSTERESIS',
 -           'TOTK_UNCAPPED', 'TOTK_UNCAPPED_HZ', 'TOTK_UNCAPPED_INTERVAL', 'TOTK_FRAME_RATE_HINT', 'TOTK_FRAME_RATE_HINT_HZ'}
 +           'TOTK_UNCAPPED', 'TOTK_UNCAPPED_HZ', 'TOTK_UNCAPPED_INTERVAL', 'TOTK_FRAME_RATE_HINT', 'TOTK_FRAME_RATE_HINT_HZ',
-+           'TOTK_RAM_SAVER', 'TOTK_VK_STAGING_RETAIN_MB', 'TOTK_SEED_WARM_MB', 'TOTK_ROMFS_MMAP'}
++           'TOTK_RAM_SAVER', 'TOTK_VK_STAGING_RETAIN_MB', 'TOTK_SEED_WARM_MB', 'TOTK_ROMFS_MMAP', 'TOTK_PSO_PREWARM'}
  FRONTEND = TOTK / 'runtime/frontend_android.c'
 +
 +
@@ -404,7 +406,7 @@ index 006c426..e84293a 100644
 +        on = self.env(ram_saver='on')
 +        self.assertIn('TOTK_RAM_SAVER=on', on); self.assertIn('TOTK_VK_STAGING_RETAIN_MB=96', on); self.assertIn('TOTK_SEED_WARM_MB=48', on)
 +        mx = self.env(ram_saver='max')
-+        for line in ('TOTK_RAM_SAVER=max', 'TOTK_VK_STAGING_RETAIN_MB=32', 'TOTK_SEED_WARM_MB=16', 'TOTK_ROMFS_MMAP=0'):
++        for line in ('TOTK_RAM_SAVER=max', 'TOTK_VK_STAGING_RETAIN_MB=32', 'TOTK_SEED_WARM_MB=16', 'TOTK_ROMFS_MMAP=0', 'TOTK_PSO_PREWARM=0'):
 +            self.assertIn(line, mx)
 +        self.assertIn('TOTK_RAM_SAVER=on', self.env(soc='SM8550'))
 +        self.assertNotIn('TOTK_RAM_SAVER=on', self.env(soc='SM8550', ram_saver='off'))
