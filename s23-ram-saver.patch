@@ -1,11 +1,49 @@
 diff --git a/games/totk/android/gfx/nvn_vk.c b/games/totk/android/gfx/nvn_vk.c
-index 956f3fb..612d72b 100644
+index 956f3fb..3ac3c22 100644
 --- a/games/totk/android/gfx/nvn_vk.c
 +++ b/games/totk/android/gfx/nvn_vk.c
 @@ -908,2 +908,3 @@ static void vk_init_once(void) {
      VKCHECK(vkCreateDevice(V.pd, &dci, NULL, &V.dev));
 +    vk_desc_pool_sizes_init();   /* S23 fork: TOTK_VK_DESC_POOL_DIV, before any layout or pool */
  #define DL(name) name = (PFN_##name)vkGetDeviceProcAddr(V.dev, #name);
+@@ -6527,4 +6528,6 @@ void vk_mem_report(void) {
+     uint64_t r[8]; vk_res_mem(r);
+-    LOGV("memory image blocks: used/free %.3f/%.3f MiB (empty blocks retained for reuse)",
+-        r[7] / 1048576.0, (r[0] - r[7]) / 1048576.0);
++    { const char *rb = getenv("TOTK_VK_RELEASE_BLOCKS"); uint64_t half[2]; vk_res_half_stats(half);
++    LOGV("memory image blocks: used/free %.3f/%.3f MiB (%s); half textures made %llu, made whole again %llu (TOTK_HALF_TEXTURES)",
++        r[7] / 1048576.0, (r[0] - r[7]) / 1048576.0, rb && !strcmp(rb, "1") ? "empty blocks beyond one spare released" : "empty blocks retained for reuse",
++        (unsigned long long)half[0], (unsigned long long)half[1]); }
+ #ifdef __GLIBC__
+diff --git a/games/totk/android/gfx/vk_draw.c b/games/totk/android/gfx/vk_draw.c
+index 09993ed..965acde 100644
+--- a/games/totk/android/gfx/vk_draw.c
++++ b/games/totk/android/gfx/vk_draw.c
+@@ -6076,2 +6076,3 @@ static void copy_b2t(const p_copy_b2t *c) {   /* buffer -> texture (row stride f
+     }
++    vk_tex_make_whole(x);
+     int bw, bh, bpb = nvn_fmt_bpb(c->tex->d.format, &bw, &bh);
+@@ -6135,2 +6136,3 @@ static void copy_t2b(const p_copy_b2t *c) {   /* texture -> buffer */
+     }
++    vk_tex_make_whole(x);
+     int bw, bh, bpb = nvn_fmt_bpb(c->tex->d.format, &bw, &bh);
+@@ -6200,2 +6202,3 @@ static void copy_t2t(const p_copy_t2t *c) {   /* texture -> texture: same size a
+     }
++    vk_tex_make_whole(s); vk_tex_make_whole(d);
+     unsigned sl = vlevel(&c->sv, c->has_sv), dl = vlevel(&c->dv, c->has_dv), sz0 = vlayer(&c->sv, c->has_sv), dz0 = vlayer(&c->dv, c->has_dv);
+@@ -6354,2 +6357,3 @@ static void clear_tex(const p_clear_tex *c) {   /* clear a texture region with a
+     vk_tex *x = vk_tex_get(c->tex); if (!x) return;
++    vk_tex_make_whole(x);
+     unsigned lv = vlevel(&c->view, c->has_view), l0 = vlayer(&c->view, c->has_view);
+diff --git a/games/totk/android/gfx/vk_int.h b/games/totk/android/gfx/vk_int.h
+index eefcc8f..03a2fec 100644
+--- a/games/totk/android/gfx/vk_int.h
++++ b/games/totk/android/gfx/vk_int.h
+@@ -470,2 +470,4 @@ int vk_tex_nvn_format(vk_tex *x);
+ uint32_t vk_tex_width(vk_tex *x, unsigned level);
++void vk_tex_make_whole(vk_tex *x);   /* TOTK_HALF_TEXTURES: full size before a GPU copy touches it */
++void vk_res_half_stats(uint64_t out[2]);   /* TOTK_HALF_TEXTURES: textures made half, made whole again */
+ uint32_t vk_tex_height(vk_tex *x, unsigned level);
 diff --git a/games/totk/android/gfx/vk_record.c b/games/totk/android/gfx/vk_record.c
 index 2d1e913..bad9b92 100644
 --- a/games/totk/android/gfx/vk_record.c
@@ -50,7 +88,7 @@ index 6b559bc..2956039 100644
 +void vk_desc_pool_sizes_init(void);
  int vk_desc_layout_fits(const VkDescriptorSetLayoutBinding *bindings, uint32_t count, char *why, size_t size);
 diff --git a/games/totk/android/gfx/vk_res.c b/games/totk/android/gfx/vk_res.c
-index 4b76828..96425ed 100644
+index 4b76828..caab5b6 100644
 --- a/games/totk/android/gfx/vk_res.c
 +++ b/games/totk/android/gfx/vk_res.c
 @@ -94,2 +94,10 @@ static pthread_mutex_t g_mem_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -90,6 +128,100 @@ index 4b76828..96425ed 100644
          pthread_mutex_unlock(&g_mem_mu);
 +        if (empty) vk_memory_release(empty, VK_MEMORY_IMAGE_BLOCK);
      }
+@@ -214,2 +235,3 @@ typedef struct vk_img {
+     int arr3d;      /* 3D, created 2D_ARRAY_COMPATIBLE: its slices can be render targets */
++    uint32_t skip;  /* TOTK_HALF_TEXTURES: the image starts at the guest's level `skip` (image level = guest level - skip) */
+     int blk_rt;     /* block-compressed, created BLOCK_TEXEL_VIEW_COMPATIBLE | EXTENDED_USAGE with attachment usage */
+@@ -455,2 +477,15 @@ static VkFormat srgb_twin(VkFormat f) {
+ }
++/* TOTK_HALF_TEXTURES=1 (S23 fork, RAM saver): textures the game uploads from its memory and only samples (block-compressed,
++   2D or 2D array, mipmapped, 128 or more on a side) are made without their first level: a quarter of the GPU memory. As
++   TOTKDroid's LARECOMP_HALF_TEXTURES: uncompressed ones stay whole (data a shader reads texel by texel - terrain heights
++   at half size lost the ground there). Views and uploads map the guest's levels; the first GPU write, copy or render
++   target use of such an image makes it whole again (img_unhalve), from the guest's bytes. Startup-only. */
++static __thread int t_half_req;
++static uint64_t g_stat_half, g_stat_unhalve;
++static int half_textures_on(void) {
++    static int on = -1;
++    if (on < 0) { const char *e = getenv("TOTK_HALF_TEXTURES"); on = e && !strcmp(e, "1");
++        LOGV("TOTK_HALF_TEXTURES=%d: %s", on, on ? "sampled-only compressed textures from their second level (a quarter of the memory)" : "textures at full size (default)"); }
++    return on;
++}
+ static vk_img *img_create_ex(const tex_t *t, int all_formats) {
+@@ -467,2 +502,10 @@ static vk_img *img_create_ex(const tex_t *t, int all_formats) {
+     im->levels = t->d.levels ? t->d.levels : 1; if (im->levels > allowed) im->levels = allowed; if (im->samples > 1) im->levels = 1;
++    if (t_half_req && half_textures_on()) {   /* S23 fork: a sampled-only, block-compressed, mipmapped texture from its second level */
++        int hbw, hbh; nvn_fmt_bpb(t->d.format, &hbw, &hbh);
++        if ((hbw > 1 || hbh > 1) && !vk_fmt_is_depth(t->d.format) && (t->d.target == 1 || t->d.target == 4) && im->samples == 1 &&
++            !(t->d.flags & (NVN_TEXTURE_FLAGS_IMAGE | NVN_TEXTURE_FLAGS_COMPRESSIBLE | NVN_TEXTURE_FLAGS_LINEAR | 0x20 | 0x40)) &&
++            !nvn_tex_is_linear(&t->d) && im->levels >= 2 && (t->d.levels ? t->d.levels : 1) >= 2 && im->w >= 128 && im->h >= 128) {
++            im->w >>= 1; im->h >>= 1; im->levels--; im->skip = 1; g_stat_half++;
++        }
++    }
+     im->fmt = f; im->nvn_fmt = t->d.format; im->aspect = vk_fmt_aspect(t->d.format);
+@@ -521,3 +564,3 @@ static uint64_t g_stat_image_replacements;
+ static int img_upgrade_inner(vk_tex *x, VkFormat want) {
+-    vk_img *old = x->im, *nu = img_create_ex(&x->t, 1);
++    vk_img *old = x->im; t_half_req = old->skip != 0; vk_img *nu = img_create_ex(&x->t, 1); t_half_req = 0;
+     if (!nu) return 0;
+@@ -556,2 +599,29 @@ static int img_upgrade_inner(vk_tex *x, VkFormat want) {
+ static int img_upgrade(vk_tex *x, VkFormat want) { return VK_REC_VALUE(VK_REC_S_RESOURCE, img_upgrade_inner(x, want)); }
++static void upload(vk_tex *x);
++/* TOTK_HALF_TEXTURES: a half image the GPU is about to write, copy or render: made again at full size from the guest's
++   bytes (it is mirrored: the guest memory holds every level), the half one retired once the GPU is past it. g_tex_mu held. */
++static int img_unhalve_locked(vk_tex *x) {
++    vk_img *old = x ? x->im : NULL;
++    if (!old || !old->skip) return 1;
++    vk_img *nu = img_create(&x->t);
++    if (!nu) return 0;
++    retire((retired_t){.img = old->img, .mem = old->mem, .views = old->views, .nviews = old->nviews});
++    old->img = nu->img; old->mem = nu->mem; old->views = NULL; old->nviews = old->capviews = 0;
++    old->w = nu->w; old->h = nu->h; old->d = nu->d; old->levels = nu->levels; old->skip = 0;
++    old->usage = nu->usage; old->blk_rt = nu->blk_rt; old->arr3d = nu->arr3d; old->nlst = nu->nlst; old->lst[0] = nu->lst[0]; old->lst[1] = nu->lst[1];
++    tex_stamp_bump(&old->identity);
++    tex_stamp_drop(nu->identity);
++    free(nu);
++    if (x->mirrored) upload(x);
++    tex_epoch_bump();
++    uint64_t n = ++g_stat_unhalve;
++    if (n <= 8 || !(n & (n - 1))) LOGV("half texture %ux%u fmt %#x made whole for a GPU write (ser %llu; %llu so far, %llu made half)",
++        old->w, old->h, x->t.d.format, (unsigned long long)x->t.serial, (unsigned long long)n, (unsigned long long)g_stat_half);
++    return 1;
++}
++void vk_res_half_stats(uint64_t out[2]) { pthread_mutex_lock(&g_tex_mu); out[0] = g_stat_half; out[1] = g_stat_unhalve; pthread_mutex_unlock(&g_tex_mu); }
++void vk_tex_make_whole(vk_tex *x) {
++    if (!x || !x->im || !x->im->skip) return;
++    pthread_mutex_lock(&g_tex_mu); img_unhalve_locked(x); pthread_mutex_unlock(&g_tex_mu);
++}
+ 
+@@ -644,4 +714,4 @@ static void upload_inner(vk_tex *x) {
+             if (linear) { size_t stride = nvn_tex_linear_stride(&t->d); bad = 0; for (size_t r = 0; r < rows * z; r++) memcpy(stg + off + r * pitch, t->mem + r * stride, pitch); }
+-            else if (pooled) { subs[ns++] = (upload_sub){l, y, stg + off, pitch}; bad = 0; }
+-            else bad = nvn_deswizzle(&t->d, l, y, t->mem, stg + off, pitch);
++            else if (pooled) { subs[ns++] = (upload_sub){l + im->skip, y, stg + off, pitch}; bad = 0; }
++            else bad = nvn_deswizzle(&t->d, l + im->skip, y, t->mem, stg + off, pitch);
+             if (bad) { RED(8, "deswizzle failed: format %#x target %d", t->d.format, t->d.target); free(regions); return; }
+@@ -737,3 +807,3 @@ static vk_tex *tex_get_inner(const tex_t *t) {
+     } else {
+-        x->im = img_create(t);
++        t_half_req = x->mirrored; x->im = img_create(t); t_half_req = 0;
+         texcopy_resource(x->mirrored ? "realize-own-upload" : "realize-gpu-only-undefined", x);
+@@ -1670,2 +1740,3 @@ static void tex_mark_gpu_written_inner(vk_tex *x) {
+     if (!x || !x->im) return;
++    if (x->im->skip) { static int n; if (++n <= 8) RED(8, "half texture written by the GPU without a whole image first (ser %llu)", (unsigned long long)x->serial); vk_tex_make_whole(x); }
+     gpu_write_range_note(x);
+@@ -1712,3 +1783,10 @@ static VkImageView view_get(vk_tex *x, const view_t *v, int attach, int want_tar
+     } else vk_fmt(fmt, NULL, &fs);
+-    unsigned l0 = v && v->set_levels ? v->base_level : 0, nl = v && v->set_levels && v->nlevels ? v->nlevels : im->levels - MINV(l0, im->levels);
++    if (im->skip && attach) { if (!img_unhalve_locked(x)) return VK_NULL_HANDLE; im = x->im; }   /* rendered into or stored to: whole again */
++    unsigned l0 = v && v->set_levels ? v->base_level : 0, nl = v && v->set_levels && v->nlevels ? v->nlevels : im->levels + im->skip - MINV(l0, im->levels + im->skip);
++    if (im->skip) {   /* the guest's levels; the image's start at im->skip */
++        unsigned cut = l0 < im->skip ? im->skip - l0 : 0;
++        nl = nl > cut ? nl - cut : 1; l0 = l0 > im->skip ? l0 - im->skip : 0;
++        if (l0 >= im->levels) l0 = im->levels - 1;
++        if (l0 + nl > im->levels) nl = im->levels - l0;
++    }
+     unsigned s0 = v && v->set_layers ? v->min_layer : 0;
 diff --git a/games/totk/android/java/com/aure/totk/RamGuard.java b/games/totk/android/java/com/aure/totk/RamGuard.java
 new file mode 100644
 index 0000000..b57b5ef
@@ -274,20 +406,25 @@ index 968cf89..3cf93f0 100644
 +        if (ramGuard != null) { ramGuard.close(); ramGuard = null; }
          if (feedback != null) { feedback.close(); feedback = null; }
 diff --git a/games/totk/android/java/com/aure/totk/setup/Diagram.java b/games/totk/android/java/com/aure/totk/setup/Diagram.java
-index b330096..456b97f 100644
+index b330096..ee5e01d 100644
 --- a/games/totk/android/java/com/aure/totk/setup/Diagram.java
 +++ b/games/totk/android/java/com/aure/totk/setup/Diagram.java
 @@ -34,3 +34,3 @@ final class Diagram extends View {
              case "game_language": return 170;
 -            case "gpu_feed": case "rumble": case "motion": return 0;   // text and facts only
-+            case "gpu_feed": case "rumble": case "motion": case "ram_saver": case "draw_distance": return 0;   // text and facts only
++            case "gpu_feed": case "rumble": case "motion": case "ram_saver": case "draw_distance": case "textures": return 0;   // text and facts only
              default: return 300;
+@@ -181,3 +181,3 @@ final class Diagram extends View {
+         String res = value("render_res");
+-        float k = res.equals("1280x720") || res.equals("game") ? 1 : res.equals("1152x648") ? .9f : .75f;
++        float k = res.equals("1280x720") || res.equals("game") ? 1 : res.equals("1152x648") ? .9f : res.equals("896x504") ? .7f : .75f;
+         RectF scene = new RectF(x0, y0 + sh * (1 - k), x0 + sw * k, y0 + sh);
 diff --git a/games/totk/android/java/com/aure/totk/setup/GameReport.java b/games/totk/android/java/com/aure/totk/setup/GameReport.java
 new file mode 100644
-index 0000000..2f2ac73
+index 0000000..add2591
 --- /dev/null
 +++ b/games/totk/android/java/com/aure/totk/setup/GameReport.java
-@@ -0,0 +1,120 @@
+@@ -0,0 +1,127 @@
 +package com.aure.totk.setup;
 +
 +import android.app.ActivityManager;
@@ -335,9 +472,16 @@ index 0000000..2f2ac73
 +        try { game = StorageLocation.gameDir(context); } catch (RuntimeException failed) { game = null; }
 +        File totkEnv = game == null ? null : new File(game, "totk.env");
 +        if (totkEnv != null && totkEnv.isFile()) out.append("\n== totk.env (developer overrides) ==\n").append(tail(totkEnv, 8 * 1024));
-+        if (game != null) out.append("\n== Memory lines from the whole session (last 40) ==\n").append(memoryLines(new File(game, "totk.log")));
-+        out.append("\n== totk.log (last ").append(LOG_TAIL_BYTES / 1024).append(" KiB of the last game session) ==\n");
-+        out.append(game == null ? "(game folder unknown)\n" : tail(new File(game, "totk.log"), LOG_TAIL_BYTES));
++        /* A game start keeps the session before it as totk.prev.log when that one was long (frontend_android.c log_start):
++           after a crash and a quick restart, the report still shows the session that ended. */
++        File log = game == null ? null : new File(game, "totk.log");
++        File prev = game == null ? null : new File(game, "totk.prev.log");
++        String which = "the last game session";
++        if (log != null && prev.isFile() && (!log.isFile() || log.length() < 256 * 1024)) { log = prev; which = "the session before the last, short one"; }
++        if (log != null) out.append("\n== Memory lines from ").append(which).append(" (last 40) ==\n").append(memoryLines(log));
++        out.append("\n== ").append(log == null ? "totk.log" : log.getName()).append(" (last ").append(LOG_TAIL_BYTES / 1024)
++                .append(" KiB of ").append(which).append(") ==\n");
++        out.append(log == null ? "(game folder unknown)\n" : tail(log, LOG_TAIL_BYTES));
 +        return out.toString();
 +    }
 +
@@ -409,23 +553,29 @@ index 0000000..2f2ac73
 +    }
 +}
 diff --git a/games/totk/android/java/com/aure/totk/setup/Settings.java b/games/totk/android/java/com/aure/totk/setup/Settings.java
-index 98f533d..f43b46e 100644
+index 98f533d..ee48512 100644
 --- a/games/totk/android/java/com/aure/totk/setup/Settings.java
 +++ b/games/totk/android/java/com/aure/totk/setup/Settings.java
-@@ -45,2 +45,3 @@ final class Settings {
+@@ -37,3 +37,3 @@ final class Settings {
+         new Option("frame_gen", PERFORMANCE, "off", "off", "on"),
+-        new Option("render_res", PERFORMANCE, "game", "game", "1280x720", "1152x648", "960x540"),
++        new Option("render_res", PERFORMANCE, "game", "game", "1280x720", "1152x648", "960x540", "896x504"),
+         new Option("latency", PERFORMANCE, "balanced", "responsive", "balanced", "smoothest"),
+@@ -45,2 +45,4 @@ final class Settings {
          new Option("shadows", PICTURE, "high", "high", "medium", "low"),
 +        new Option("draw_distance", PICTURE, "game", "game", "4000", "2000", "1000"),
++        new Option("textures", PICTURE, "full", "full", "half"),
          new Option("console_mode", SCREEN, "handheld", "handheld", "docked"),
-@@ -50,2 +51,3 @@ final class Settings {
+@@ -50,2 +52,3 @@ final class Settings {
          new Option("second_screen", SCREEN, "on", "off", "on"),
 +        new Option("ram_saver", SCREEN, "off", "off", "on", "max"),
          new Option("buttons", CONTROLS, "nintendo", "nintendo", "xbox"),
-@@ -90,2 +92,4 @@ final class Settings {
+@@ -90,2 +93,4 @@ final class Settings {
          if (stored == null || !stored.containsKey("gpu_feed")) values.put("gpu_feed", gpuFeedDefault(soc));
 +        // RAM saver (S23 fork): a store without the key adopts the chip default; explicit choices win.
 +        if (stored == null || !stored.containsKey("ram_saver")) values.put("ram_saver", ramSaverDefault(soc));
      }
-@@ -190,2 +194,7 @@ final class Settings {
+@@ -190,2 +195,7 @@ final class Settings {
      }
 +    /** RAM saver default: On for phones with the Snapdragon 8 Gen 2 (SM8550: Galaxy S23 series and similar), whose
 +     * Android keeps far more running than a handheld; Off elsewhere (the AYN Thor reports QCS8550). */
@@ -433,16 +583,17 @@ index 98f533d..f43b46e 100644
 +        return "SM8550".equals(socToken(soc)) ? "on" : "off";
 +    }
      /** Whether profile(soc) is backed by a device test (the "Recommended for this device" badge). */
-@@ -202,2 +211,3 @@ final class Settings {
+@@ -202,2 +212,3 @@ final class Settings {
          if (tab.equals(PERFORMANCE)) values.put("gpu_feed", gpuFeedDefault(soc));
 +        if (tab.equals(SCREEN)) values.put("ram_saver", ramSaverDefault(soc));
      }
-@@ -262,2 +272,4 @@ final class Settings {
+@@ -262,2 +273,5 @@ final class Settings {
          }
 +        // S23 fork: the render camera's far plane in metres (runtime/game_patches_v143.c); simulation is unchanged.
 +        if (!get("draw_distance").equals("game")) line(out, "TOTK_FAR_CLAMP=" + get("draw_distance"));
++        if (get("textures").equals("half")) line(out, "TOTK_HALF_TEXTURES=1");
          line(out, "TOTK_OPERATION_MODE=" + get("console_mode"));
-@@ -267,2 +279,22 @@ final class Settings {
+@@ -267,2 +281,22 @@ final class Settings {
          line(out, "TOTK_COMPANION=" + (get("second_screen").equals("on") ? "1" : "0"));
 +        // RAM saver: caps only the app's own caches (texture-upload staging, preloaded shaders); the game's memory pool
 +        // is never reduced. TOTK_RAM_SAVER is read by RamGuard in the game process (live trims under memory pressure).
@@ -466,35 +617,41 @@ index 98f533d..f43b46e 100644
 +        }
          line(out, "TOTK_FACE_BUTTONS=" + (get("buttons").equals("xbox") ? "position" : "label"));
 diff --git a/games/totk/android/java/com/aure/totk/setup/SetupActivity.java b/games/totk/android/java/com/aure/totk/setup/SetupActivity.java
-index c8e30d3..fd413bb 100644
+index c8e30d3..242b2b1 100644
 --- a/games/totk/android/java/com/aure/totk/setup/SetupActivity.java
 +++ b/games/totk/android/java/com/aure/totk/setup/SetupActivity.java
 @@ -1264,3 +1264,3 @@ public final class SetupActivity extends Activity implements SetupService.Listen
              case Settings.PERFORMANCE: keys.addAll(Arrays.asList("frame_rate", "frame_gen", "render_res", "latency", "gpu_feed")); break;
 -            case Settings.PICTURE: keys.addAll(Arrays.asList("upscaler", "sharpness", "aa", "shadows")); break;
-+            case Settings.PICTURE: keys.addAll(Arrays.asList("upscaler", "sharpness", "aa", "shadows", "draw_distance")); break;
++            case Settings.PICTURE: keys.addAll(Arrays.asList("upscaler", "sharpness", "aa", "shadows", "draw_distance", "textures")); break;
              default:
 @@ -1268,2 +1268,3 @@ public final class SetupActivity extends Activity implements SetupService.Listen
                  if (SettingsStore.secondaryDisplay(this)) keys.add("second_screen");
 +                keys.add("ram_saver");
          }
-@@ -1395,2 +1396,3 @@ public final class SetupActivity extends Activity implements SetupService.Listen
+@@ -1390,3 +1391,3 @@ public final class SetupActivity extends Activity implements SetupService.Listen
+             case "gpu_feed": return value.equals("on") ? 1 : 0;
+-            case "render_res": return value.equals("960x540") ? 1 : value.equals("1152x648") ? 2 : 3;
++            case "render_res": return value.equals("960x540") || value.equals("896x504") ? 1 : value.equals("1152x648") ? 2 : 3;
+             case "upscaler": return value.equals("off") ? 0 : 1;
+@@ -1395,2 +1396,4 @@ public final class SetupActivity extends Activity implements SetupService.Listen
              case "shadows": return value.equals("high") ? 3 : value.equals("medium") ? 2 : 1;
 +            case "draw_distance": return value.equals("game") ? 3 : value.equals("4000") ? 2 : 1;
++            case "textures": return value.equals("half") ? 1 : 3;
              case "console_mode": return value.equals("docked") ? 4 : 2;
-@@ -1473,2 +1475,5 @@ public final class SetupActivity extends Activity implements SetupService.Listen
+@@ -1473,2 +1476,5 @@ public final class SetupActivity extends Activity implements SetupService.Listen
                      break;
-+                case "ram_saver": case "draw_distance":
++                case "ram_saver": case "draw_distance": case "textures":
 +                    fact(Strings.APPLIES, Strings.WHEN_STARTS);
 +                    break;
                  case "audio_latency":
-@@ -2371,2 +2376,5 @@ public final class SetupActivity extends Activity implements SetupService.Listen
+@@ -2371,2 +2377,5 @@ public final class SetupActivity extends Activity implements SetupService.Listen
          Widgets.Row updateRow = updateSwitch(list);
 +        // S23 fork: the last game session's log and Android's exit reasons, shared as text (no root needed).
 +        Widgets.Row logRow = listRow(list, "about:gamelog", "Share game log", "Why the game closed · for a bug report", 92, 18);
 +        logRow.setOnClickListener(v -> shareGameLog(version));
          detailPanel();
-@@ -2389,2 +2397,7 @@ public final class SetupActivity extends Activity implements SetupService.Listen
+@@ -2389,2 +2398,7 @@ public final class SetupActivity extends Activity implements SetupService.Listen
                  detailTitle.setText(Strings.UPDATES); detailText.setText(Strings.UPDATE_PRIVACY);
 +            } else if (v == logRow) {
 +                detailTitle.setText("Share game log");
@@ -502,12 +659,12 @@ index c8e30d3..fd413bb 100644
 +                        + "device's memory, the menu settings and the end of the last game session's log. Share it before "
 +                        + "starting the game again: the next start overwrites the log. No game files, keys or saves are included.");
              } else {
-@@ -2396,3 +2409,3 @@ public final class SetupActivity extends Activity implements SetupService.Listen
+@@ -2396,3 +2410,3 @@ public final class SetupActivity extends Activity implements SetupService.Listen
          versionRow.setOnFocusChangeListener(detail); licencesRow.setOnFocusChangeListener(detail); project.setOnFocusChangeListener(detail);
 -        updateRow.setOnFocusChangeListener(detail);
 +        updateRow.setOnFocusChangeListener(detail); logRow.setOnFocusChangeListener(detail);
          primary = versionRow;
-@@ -2401,2 +2414,22 @@ public final class SetupActivity extends Activity implements SetupService.Listen
+@@ -2401,2 +2415,22 @@ public final class SetupActivity extends Activity implements SetupService.Listen
  
 +    private boolean sharingGameLog;
 +    private void shareGameLog(String version) {
@@ -531,55 +688,70 @@ index c8e30d3..fd413bb 100644
 +
      /** The source commit this APK was built from: assets/build.txt ("commit <hash>", written by build_release.py). */
 diff --git a/games/totk/android/java/com/aure/totk/setup/Strings.java b/games/totk/android/java/com/aure/totk/setup/Strings.java
-index 6ce0578..eeab37e 100644
+index 6ce0578..3ad4e02 100644
 --- a/games/totk/android/java/com/aure/totk/setup/Strings.java
 +++ b/games/totk/android/java/com/aure/totk/setup/Strings.java
-@@ -138,2 +138,3 @@ final class Strings {
+@@ -138,2 +138,4 @@ final class Strings {
              case "shadows": return "Shadows";
 +            case "draw_distance": return "Draw distance";
++            case "textures": return "Texture size";
              case "console_mode": return "Console mode";
-@@ -143,2 +144,3 @@ final class Strings {
+@@ -143,2 +145,3 @@ final class Strings {
              case "second_screen": return "Second screen";
 +            case "ram_saver": return "RAM saver";
              case "buttons": return "Button layout";
-@@ -162,2 +164,3 @@ final class Strings {
+@@ -162,2 +165,4 @@ final class Strings {
              case "shadows": return "Lower saves GPU time in busy areas";
 +            case "draw_distance": return "How far the world is drawn · fewer draws";
++            case "textures": return "Half saves graphics memory · softer surfaces";
              case "console_mode": return "Docked uses the game's larger TV resolution";
-@@ -167,2 +170,3 @@ final class Strings {
+@@ -167,2 +172,3 @@ final class Strings {
              case "second_screen": return "Map, inventory and shortcuts on the lower display";
 +            case "ram_saver": return "Off · On · Max: smaller caches, fewer kills";
              case "buttons": return "Which face button is the Switch's A";
-@@ -198,2 +202,5 @@ final class Strings {
+@@ -198,2 +204,8 @@ final class Strings {
                      + "textures sharper for a little more GPU time; Off is crispest but shows the steps.";
++            case "textures": return "Half loads the game's textures from their second, smaller level: about a quarter of the graphics "
++                    + "memory they take, so less is pushed out of RAM. Surfaces look softer up close. Text, menus and "
++                    + "render targets stay full size.";
 +            case "draw_distance": return "Caps how far the camera draws the world. Shorter means fewer objects to draw each frame, "
 +                    + "which eases the processor (the usual limit on phones) and needs fewer graphics buffers. Distant land is "
 +                    + "cut at the horizon and far objects pop in later; what the game simulates is unchanged.";
              case "shadows": return "The resolution of the shadow maps. Lower saves GPU time where many shadows are on screen; their "
-@@ -207,2 +214,6 @@ final class Strings {
+@@ -207,2 +219,6 @@ final class Strings {
              case "overlay_pos": return "Which corner of the screen the performance overlay sits in.";
 +            case "ram_saver": return "Keeps the app's own caches small so Android is less likely to close the game or the apps "
 +                    + "behind it. On caps texture-upload staging and preloaded shaders; Max caps them harder, reads the game "
 +                    + "image from storage instead of mapping it and builds only the shaders a scene needs. While playing, if free RAM runs low, staging is trimmed further "
 +                    + "on its own. The game's own memory is never reduced. May add short stutters the first time new areas load.";
              case "second_screen": return "On handhelds with a second display, shows the map, inventory and shortcuts on it while you "
-@@ -229,2 +240,3 @@ final class Strings {
+@@ -229,2 +245,4 @@ final class Strings {
              case "upscaler": return upscalerName(value);
 +            case "draw_distance": return value.equals("game") ? "Game default" : (Integer.parseInt(value) / 1000) + " km";
++            case "textures": return value.equals("half") ? "Half" : "Full";
              case "aa": return value.equals("fxaa") ? "Game (FXAA)" : value.equals("smaa") ? "SMAA" : "Off";
 diff --git a/games/totk/runtime/frontend_android.c b/games/totk/runtime/frontend_android.c
-index ce1efe5..4ad810e 100644
+index ce1efe5..0189722 100644
 --- a/games/totk/runtime/frontend_android.c
 +++ b/games/totk/runtime/frontend_android.c
-@@ -1268,2 +1268,6 @@ static const char *const settings_keys[] = {
+@@ -1147,2 +1147,8 @@ static void log_start(void) {
+     snprintf(g_log_path, sizeof g_log_path, "%s/totk.log", g_data);
++    {   /* S23 fork: the previous session's log survives one restart (the menu's "Share game log" reads it when the
++           newest session is too short to say why the one before ended) */
++        char prev[1120]; snprintf(prev, sizeof prev, "%s/totk.prev.log", g_data);
++        struct stat st;
++        if (!stat(g_log_path, &st) && st.st_size > 256 * 1024) rename(g_log_path, prev);
++    }
+     g_log_fd = open(g_log_path, O_WRONLY | O_CREAT | O_TRUNC | O_APPEND | O_CLOEXEC, 0644);
+@@ -1268,2 +1274,6 @@ static const char *const settings_keys[] = {
      "TOTK_DATA_DIR",
 +    /* RAM saver (S23 fork): host-side caches only; the game's own 3.2 GiB pool is never reduced. */
 +    "TOTK_RAM_SAVER", "TOTK_VK_STAGING_RETAIN_MB", "TOTK_SEED_WARM_MB", "TOTK_ROMFS_MMAP", "TOTK_PSO_PREWARM",
 +    "TOTK_VK_REC_MEMORY_MB", "TOTK_VK_DESC_POOL_DIV", "TOTK_FAR_CLAMP",
-+    "TOTK_VK_RELEASE_BLOCKS",
++    "TOTK_VK_RELEASE_BLOCKS", "TOTK_HALF_TEXTURES",
  };
 diff --git a/tests/test_android_settings.py b/tests/test_android_settings.py
-index 006c426..13886e2 100644
+index 006c426..147fafb 100644
 --- a/tests/test_android_settings.py
 +++ b/tests/test_android_settings.py
 @@ -23,4 +23,14 @@ ALLOWED = {'TOTK_FPS60', 'TOTK_GPU_TIME', 'TOTK_FRAMEGEN', 'TOTK_REALTIME', 'TOT
@@ -588,7 +760,7 @@ index 006c426..13886e2 100644
 +           'TOTK_UNCAPPED', 'TOTK_UNCAPPED_HZ', 'TOTK_UNCAPPED_INTERVAL', 'TOTK_FRAME_RATE_HINT', 'TOTK_FRAME_RATE_HINT_HZ',
 +           'TOTK_RAM_SAVER', 'TOTK_VK_STAGING_RETAIN_MB', 'TOTK_SEED_WARM_MB', 'TOTK_ROMFS_MMAP', 'TOTK_PSO_PREWARM',
 +           'TOTK_VK_REC_MEMORY_MB', 'TOTK_VK_DESC_POOL_DIV', 'TOTK_FAR_CLAMP',
-+           'TOTK_VK_RELEASE_BLOCKS'}
++           'TOTK_VK_RELEASE_BLOCKS', 'TOTK_HALF_TEXTURES'}
  FRONTEND = TOTK / 'runtime/frontend_android.c'
 +
 +
@@ -603,7 +775,7 @@ index 006c426..13886e2 100644
 -                    self.assertEqual(self.run_probe(f'envsocpreset {preset} {soc} en-GB')[0].replace('|', '\n'), before)
 +                    self.assertEqual(self.run_probe(f'envsocpreset {preset} {soc} en-GB')[0].replace('|', '\n'), with_ram_saver(before, soc))
                  for feed in ('off', 'on'):
-@@ -263,2 +273,18 @@ class SettingsTests(unittest.TestCase):
+@@ -263,2 +273,23 @@ class SettingsTests(unittest.TestCase):
  
 +    def test_ram_saver_levels(self):
 +        self.assertFalse(any('RAM' in l or 'SEED' in l for l in self.env(soc='QCS8550')))
@@ -616,13 +788,18 @@ index 006c426..13886e2 100644
 +        self.assertIn('TOTK_RAM_SAVER=on', self.env(soc='SM8550'))
 +        self.assertNotIn('TOTK_RAM_SAVER=on', self.env(soc='SM8550', ram_saver='off'))
 +
++    def test_textures(self):
++        self.assertNotIn('TOTK_HALF_TEXTURES', self.env())
++        self.assertIn('TOTK_HALF_TEXTURES=1', self.env(textures='half'))
++        self.assertIn('TOTK_RENDER_RES=896x504', self.env(render_res='896x504'))
++
 +    def test_draw_distance(self):
 +        self.assertFalse(any(l.startswith('TOTK_FAR_CLAMP') for l in self.env()))
 +        for metres in ('4000', '2000', '1000'):
 +            self.assertIn('TOTK_FAR_CLAMP=' + metres, self.env(draw_distance=metres))
 +
      def test_frame_lag_only_adds_one_line_to_odin_native_sixty_bytes(self):
-@@ -291,3 +317,3 @@ class SettingsTests(unittest.TestCase):
+@@ -291,3 +322,3 @@ class SettingsTests(unittest.TestCase):
                              actual = self.run_probe(f'envsoc {soc} en-GB frame_rate={rate} frame_gen={framegen} gpu_feed={feed}')[0].replace('|', '\n')
 -                            self.assertEqual(actual.encode(), expected.encode())
 +                            self.assertEqual(actual.encode(), with_ram_saver(expected, soc).encode())
