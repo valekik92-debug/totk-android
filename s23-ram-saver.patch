@@ -1,9 +1,9 @@
 diff --git a/games/totk/android/java/com/aure/totk/RamGuard.java b/games/totk/android/java/com/aure/totk/RamGuard.java
 new file mode 100644
-index 0000000..7530bcf
+index 0000000..b57b5ef
 --- /dev/null
 +++ b/games/totk/android/java/com/aure/totk/RamGuard.java
-@@ -0,0 +1,112 @@
+@@ -0,0 +1,160 @@
 +package com.aure.totk;
 +
 +import android.app.ActivityManager;
@@ -18,6 +18,8 @@ index 0000000..7530bcf
 +import java.io.FileReader;
 +import java.io.IOException;
 +import java.nio.charset.StandardCharsets;
++import java.util.ArrayList;
++import java.util.List;
 +
 +/** RAM saver (S23 fork), game process side. When the menu's RAM saver is On or Max (TOTK_RAM_SAVER in settings.env),
 + * a low-priority thread checks the system's free memory every 2 s. When it falls near Android's low-memory threshold,
@@ -36,6 +38,7 @@ index 0000000..7530bcf
 +    private final Handler handler;
 +    private final ActivityManager.MemoryInfo info = new ActivityManager.MemoryInfo();
 +    private boolean trimmed;
++    private int ticks;
 +    private long calmSince;
 +    private volatile boolean closed;
 +
@@ -98,7 +101,52 @@ index 0000000..7530bcf
 +        } catch (RuntimeException failed) {
 +            Log.w(TAG, "memory check failed", failed);
 +        }
++        // Every 30 s, where the memory goes (two lines: totk.ctl takes at most 240 characters per line).
++        if (++ticks % 15 == 0) {
++            try { write("mark mem1: " + memLine() + "\nmark mem2: " + gpuLine() + "\n"); }
++            catch (RuntimeException failed) { Log.w(TAG, "memory snapshot failed", failed); }
++        }
 +        if (!closed) handler.postDelayed(this::check, PERIOD_MS);
++    }
++
++    /** System free memory and this process's resident memory by kind, MiB (/proc/self/status: kB). */
++    private String memLine() {
++        StringBuilder out = new StringBuilder();
++        out.append("avail=").append(info.availMem / MIB).append(" thr=").append(info.threshold / MIB);
++        for (String line : lines("/proc/self/status", 64)) {
++            for (String key : new String[]{"VmRSS", "RssAnon", "RssFile", "RssShmem", "VmSwap"}) {
++                if (line.startsWith(key + ":")) {
++                    String kb = line.substring(key.length() + 1).trim().split("\\s+")[0];
++                    try { out.append(' ').append(key).append('=').append(Long.parseLong(kb) >> 10); }
++                    catch (NumberFormatException ignored) { }
++                }
++            }
++        }
++        return out.toString();
++    }
++    /** GPU (KGSL) allocations of this process, MiB, and memory pressure (PSI avg10), where the device exposes them. */
++    private String gpuLine() {
++        StringBuilder out = new StringBuilder("kgsl");
++        String dir = "/sys/class/kgsl/kgsl/proc/" + Process.myPid() + "/";
++        for (String name : new String[]{"kernel", "gpumem_mapped", "imported_mem"}) {
++            List<String> v = lines(dir + name, 1);
++            out.append(' ').append(name).append('=');
++            try { out.append(v.isEmpty() ? "-" : String.valueOf(Long.parseLong(v.get(0).trim()) / MIB)); }
++            catch (NumberFormatException bad) { out.append('?'); }
++        }
++        for (String line : lines("/proc/pressure/memory", 2)) {
++            int at = line.indexOf("avg10=");
++            if (at >= 0) out.append(" psi-").append(line.substring(0, line.indexOf(' '))).append('=')
++                    .append(line.substring(at + 6, line.indexOf(' ', at) < 0 ? line.length() : line.indexOf(' ', at)));
++        }
++        return out.toString();
++    }
++    private static List<String> lines(String path, int max) {
++        List<String> out = new ArrayList<>();
++        try (BufferedReader in = new BufferedReader(new FileReader(path))) {
++            for (String line; out.size() < max && (line = in.readLine()) != null; ) out.add(line);
++        } catch (IOException | SecurityException unavailable) { }
++        return out;
 +    }
 +    /** Appends one complete line (one write) to totk.ctl; the game's reader stages only appended complete lines. */
 +    private boolean write(String line) {
