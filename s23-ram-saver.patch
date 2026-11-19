@@ -1,3 +1,54 @@
+diff --git a/games/totk/android/gfx/nvn_vk.c b/games/totk/android/gfx/nvn_vk.c
+index 956f3fb..612d72b 100644
+--- a/games/totk/android/gfx/nvn_vk.c
++++ b/games/totk/android/gfx/nvn_vk.c
+@@ -908,2 +908,3 @@ static void vk_init_once(void) {
+     VKCHECK(vkCreateDevice(V.pd, &dci, NULL, &V.dev));
++    vk_desc_pool_sizes_init();   /* S23 fork: TOTK_VK_DESC_POOL_DIV, before any layout or pool */
+ #define DL(name) name = (PFN_##name)vkGetDeviceProcAddr(V.dev, #name);
+diff --git a/games/totk/android/gfx/vk_record.c b/games/totk/android/gfx/vk_record.c
+index 2d1e913..bad9b92 100644
+--- a/games/totk/android/gfx/vk_record.c
++++ b/games/totk/android/gfx/vk_record.c
+@@ -544,3 +544,3 @@ void vk_record_test_results(uint64_t *checks, uint64_t *failures, uint64_t *rese
+    descriptor): they are not declared, since every declared descriptor is driver memory reserved in every pool. */
+-const VkDescriptorPoolSize vk_desc_pool_sizes[VK_DESC_POOL_TYPES] = {
++VkDescriptorPoolSize vk_desc_pool_sizes[VK_DESC_POOL_TYPES] = {
+     {VK_DESCRIPTOR_TYPE_SAMPLER, 8192}, {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 32768},
+@@ -549,2 +549,20 @@ const VkDescriptorPoolSize vk_desc_pool_sizes[VK_DESC_POOL_TYPES] = {
+     {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 32768}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 8192}};
++static uint64_t desc_pool_bytes(void);
++void vk_desc_pool_sizes_init(void) {
++    static int done;
++    if (done) return;
++    done = 1;
++    const char *e = getenv("TOTK_VK_DESC_POOL_DIV");
++    unsigned div = e ? (unsigned)atoi(e) : 1;
++    if (div != 2 && div != 4 && div != 8) div = 1;
++    /* Floors keep any single descriptor set the game makes far inside one pool (NVN: at most 32 textures, 18 uniform
++       buffers and 16 storage buffers per stage, five stages). */
++    static const uint32_t floor_count[VK_DESC_POOL_TYPES] = {512, 2048, 512, 256, 256, 128, 2048, 512};
++    for (unsigned t = 0; t < VK_DESC_POOL_TYPES; t++) {
++        uint32_t n = vk_desc_pool_sizes[t].descriptorCount / div;
++        vk_desc_pool_sizes[t].descriptorCount = n < floor_count[t] ? floor_count[t] : n;
++    }
++    if (div > 1) fprintf(stderr, "[nvn-vk] descriptor pools: TOTK_VK_DESC_POOL_DIV=%u, ~%.1f MiB per pool\n", div,
++                         desc_pool_bytes() / 1048576.0);
++}
+ int vk_desc_layout_fits(const VkDescriptorSetLayoutBinding *bindings, uint32_t count, char *why, size_t size) {
+diff --git a/games/totk/android/gfx/vk_record.h b/games/totk/android/gfx/vk_record.h
+index 6b559bc..2956039 100644
+--- a/games/totk/android/gfx/vk_record.h
++++ b/games/totk/android/gfx/vk_record.h
+@@ -137,3 +137,7 @@ void vk_record_primary_pools(int64_t delta); /* primary slots' retained descript
+ enum { VK_DESC_POOL_TYPES = 8 };
+-extern const VkDescriptorPoolSize vk_desc_pool_sizes[VK_DESC_POOL_TYPES];
++extern VkDescriptorPoolSize vk_desc_pool_sizes[VK_DESC_POOL_TYPES];
++/* S23 fork: TOTK_VK_DESC_POOL_DIV (1, 2, 4 or 8; default 1) divides every pool's descriptor counts (maxSets unchanged).
++   Turnip backs a pool's declared descriptors with GPU memory at creation, ~7.4 MiB per pool at 1. Called once at device
++   creation, after the launcher's settings are in the environment; a pool that runs short moves to the next pool. */
++void vk_desc_pool_sizes_init(void);
+ int vk_desc_layout_fits(const VkDescriptorSetLayoutBinding *bindings, uint32_t count, char *why, size_t size);
 diff --git a/games/totk/android/java/com/aure/totk/RamGuard.java b/games/totk/android/java/com/aure/totk/RamGuard.java
 new file mode 100644
 index 0000000..b57b5ef
@@ -317,7 +368,7 @@ index 0000000..2f2ac73
 +    }
 +}
 diff --git a/games/totk/android/java/com/aure/totk/setup/Settings.java b/games/totk/android/java/com/aure/totk/setup/Settings.java
-index 98f533d..fab5d7a 100644
+index 98f533d..acb4c12 100644
 --- a/games/totk/android/java/com/aure/totk/setup/Settings.java
 +++ b/games/totk/android/java/com/aure/totk/setup/Settings.java
 @@ -50,2 +50,3 @@ final class Settings {
@@ -341,7 +392,7 @@ index 98f533d..fab5d7a 100644
          if (tab.equals(PERFORMANCE)) values.put("gpu_feed", gpuFeedDefault(soc));
 +        if (tab.equals(SCREEN)) values.put("ram_saver", ramSaverDefault(soc));
      }
-@@ -267,2 +276,18 @@ final class Settings {
+@@ -267,2 +276,20 @@ final class Settings {
          line(out, "TOTK_COMPANION=" + (get("second_screen").equals("on") ? "1" : "0"));
 +        // RAM saver: caps only the app's own caches (texture-upload staging, preloaded shaders); the game's memory pool
 +        // is never reduced. TOTK_RAM_SAVER is read by RamGuard in the game process (live trims under memory pressure).
@@ -356,6 +407,8 @@ index 98f533d..fab5d7a 100644
 +                line(out, "TOTK_PSO_PREWARM=0");
 +                // Recorder slabs: keep 16 MiB of idle capacity instead of 64 (the backend's floor).
 +                line(out, "TOTK_VK_REC_MEMORY_MB=16");
++                // Descriptor pools: a quarter of the declared descriptors (~1.9 instead of ~7.4 MiB of GPU memory per pool).
++                line(out, "TOTK_VK_DESC_POOL_DIV=4");
 +                break;
 +            default: break;
 +        }
@@ -436,17 +489,17 @@ index 6ce0578..0072fb7 100644
 +                    + "on its own. The game's own memory is never reduced. May add short stutters the first time new areas load.";
              case "second_screen": return "On handhelds with a second display, shows the map, inventory and shortcuts on it while you "
 diff --git a/games/totk/runtime/frontend_android.c b/games/totk/runtime/frontend_android.c
-index ce1efe5..c16f42a 100644
+index ce1efe5..cd2ab2e 100644
 --- a/games/totk/runtime/frontend_android.c
 +++ b/games/totk/runtime/frontend_android.c
 @@ -1268,2 +1268,5 @@ static const char *const settings_keys[] = {
      "TOTK_DATA_DIR",
 +    /* RAM saver (S23 fork): host-side caches only; the game's own 3.2 GiB pool is never reduced. */
 +    "TOTK_RAM_SAVER", "TOTK_VK_STAGING_RETAIN_MB", "TOTK_SEED_WARM_MB", "TOTK_ROMFS_MMAP", "TOTK_PSO_PREWARM",
-+    "TOTK_VK_REC_MEMORY_MB",
++    "TOTK_VK_REC_MEMORY_MB", "TOTK_VK_DESC_POOL_DIV",
  };
 diff --git a/tests/test_android_settings.py b/tests/test_android_settings.py
-index 006c426..46b0fea 100644
+index 006c426..40f2c82 100644
 --- a/tests/test_android_settings.py
 +++ b/tests/test_android_settings.py
 @@ -23,4 +23,13 @@ ALLOWED = {'TOTK_FPS60', 'TOTK_GPU_TIME', 'TOTK_FRAMEGEN', 'TOTK_REALTIME', 'TOT
@@ -454,7 +507,7 @@ index 006c426..46b0fea 100644
 -           'TOTK_UNCAPPED', 'TOTK_UNCAPPED_HZ', 'TOTK_UNCAPPED_INTERVAL', 'TOTK_FRAME_RATE_HINT', 'TOTK_FRAME_RATE_HINT_HZ'}
 +           'TOTK_UNCAPPED', 'TOTK_UNCAPPED_HZ', 'TOTK_UNCAPPED_INTERVAL', 'TOTK_FRAME_RATE_HINT', 'TOTK_FRAME_RATE_HINT_HZ',
 +           'TOTK_RAM_SAVER', 'TOTK_VK_STAGING_RETAIN_MB', 'TOTK_SEED_WARM_MB', 'TOTK_ROMFS_MMAP', 'TOTK_PSO_PREWARM',
-+           'TOTK_VK_REC_MEMORY_MB'}
++           'TOTK_VK_REC_MEMORY_MB', 'TOTK_VK_DESC_POOL_DIV'}
  FRONTEND = TOTK / 'runtime/frontend_android.c'
 +
 +
@@ -477,7 +530,7 @@ index 006c426..46b0fea 100644
 +        on = self.env(ram_saver='on')
 +        self.assertIn('TOTK_RAM_SAVER=on', on); self.assertIn('TOTK_VK_STAGING_RETAIN_MB=96', on); self.assertIn('TOTK_SEED_WARM_MB=48', on)
 +        mx = self.env(ram_saver='max')
-+        for line in ('TOTK_RAM_SAVER=max', 'TOTK_VK_STAGING_RETAIN_MB=32', 'TOTK_SEED_WARM_MB=16', 'TOTK_ROMFS_MMAP=0', 'TOTK_PSO_PREWARM=0', 'TOTK_VK_REC_MEMORY_MB=16'):
++        for line in ('TOTK_RAM_SAVER=max', 'TOTK_VK_STAGING_RETAIN_MB=32', 'TOTK_SEED_WARM_MB=16', 'TOTK_ROMFS_MMAP=0', 'TOTK_PSO_PREWARM=0', 'TOTK_VK_REC_MEMORY_MB=16', 'TOTK_VK_DESC_POOL_DIV=4'):
 +            self.assertIn(line, mx)
 +        self.assertIn('TOTK_RAM_SAVER=on', self.env(soc='SM8550'))
 +        self.assertNotIn('TOTK_RAM_SAVER=on', self.env(soc='SM8550', ram_saver='off'))
