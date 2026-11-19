@@ -233,13 +233,13 @@ index 968cf89..3cf93f0 100644
 +        if (ramGuard != null) { ramGuard.close(); ramGuard = null; }
          if (feedback != null) { feedback.close(); feedback = null; }
 diff --git a/games/totk/android/java/com/aure/totk/setup/Diagram.java b/games/totk/android/java/com/aure/totk/setup/Diagram.java
-index b330096..c3cdc35 100644
+index b330096..6b0b4c1 100644
 --- a/games/totk/android/java/com/aure/totk/setup/Diagram.java
 +++ b/games/totk/android/java/com/aure/totk/setup/Diagram.java
 @@ -34,3 +34,3 @@ final class Diagram extends View {
              case "game_language": return 170;
 -            case "gpu_feed": case "rumble": case "motion": return 0;   // text and facts only
-+            case "gpu_feed": case "rumble": case "motion": case "ram_saver": return 0;   // text and facts only
++            case "gpu_feed": case "rumble": case "motion": case "ram_saver": case "draw_distance": return 0;   // text and facts only
              default: return 300;
 diff --git a/games/totk/android/java/com/aure/totk/setup/GameReport.java b/games/totk/android/java/com/aure/totk/setup/GameReport.java
 new file mode 100644
@@ -368,19 +368,23 @@ index 0000000..2f2ac73
 +    }
 +}
 diff --git a/games/totk/android/java/com/aure/totk/setup/Settings.java b/games/totk/android/java/com/aure/totk/setup/Settings.java
-index 98f533d..acb4c12 100644
+index 98f533d..f43b46e 100644
 --- a/games/totk/android/java/com/aure/totk/setup/Settings.java
 +++ b/games/totk/android/java/com/aure/totk/setup/Settings.java
-@@ -50,2 +50,3 @@ final class Settings {
+@@ -45,2 +45,3 @@ final class Settings {
+         new Option("shadows", PICTURE, "high", "high", "medium", "low"),
++        new Option("draw_distance", PICTURE, "game", "game", "4000", "2000", "1000"),
+         new Option("console_mode", SCREEN, "handheld", "handheld", "docked"),
+@@ -50,2 +51,3 @@ final class Settings {
          new Option("second_screen", SCREEN, "on", "off", "on"),
 +        new Option("ram_saver", SCREEN, "off", "off", "on", "max"),
          new Option("buttons", CONTROLS, "nintendo", "nintendo", "xbox"),
-@@ -90,2 +91,4 @@ final class Settings {
+@@ -90,2 +92,4 @@ final class Settings {
          if (stored == null || !stored.containsKey("gpu_feed")) values.put("gpu_feed", gpuFeedDefault(soc));
 +        // RAM saver (S23 fork): a store without the key adopts the chip default; explicit choices win.
 +        if (stored == null || !stored.containsKey("ram_saver")) values.put("ram_saver", ramSaverDefault(soc));
      }
-@@ -190,2 +193,7 @@ final class Settings {
+@@ -190,2 +194,7 @@ final class Settings {
      }
 +    /** RAM saver default: On for phones with the Snapdragon 8 Gen 2 (SM8550: Galaxy S23 series and similar), whose
 +     * Android keeps far more running than a handheld; Off elsewhere (the AYN Thor reports QCS8550). */
@@ -388,11 +392,16 @@ index 98f533d..acb4c12 100644
 +        return "SM8550".equals(socToken(soc)) ? "on" : "off";
 +    }
      /** Whether profile(soc) is backed by a device test (the "Recommended for this device" badge). */
-@@ -202,2 +210,3 @@ final class Settings {
+@@ -202,2 +211,3 @@ final class Settings {
          if (tab.equals(PERFORMANCE)) values.put("gpu_feed", gpuFeedDefault(soc));
 +        if (tab.equals(SCREEN)) values.put("ram_saver", ramSaverDefault(soc));
      }
-@@ -267,2 +276,20 @@ final class Settings {
+@@ -262,2 +272,4 @@ final class Settings {
+         }
++        // S23 fork: the render camera's far plane in metres (runtime/game_patches_v143.c); simulation is unchanged.
++        if (!get("draw_distance").equals("game")) line(out, "TOTK_FAR_CLAMP=" + get("draw_distance"));
+         line(out, "TOTK_OPERATION_MODE=" + get("console_mode"));
+@@ -267,2 +279,20 @@ final class Settings {
          line(out, "TOTK_COMPANION=" + (get("second_screen").equals("on") ? "1" : "0"));
 +        // RAM saver: caps only the app's own caches (texture-upload staging, preloaded shaders); the game's memory pool
 +        // is never reduced. TOTK_RAM_SAVER is read by RamGuard in the game process (live trims under memory pressure).
@@ -414,26 +423,35 @@ index 98f533d..acb4c12 100644
 +        }
          line(out, "TOTK_FACE_BUTTONS=" + (get("buttons").equals("xbox") ? "position" : "label"));
 diff --git a/games/totk/android/java/com/aure/totk/setup/SetupActivity.java b/games/totk/android/java/com/aure/totk/setup/SetupActivity.java
-index c8e30d3..64a7b97 100644
+index c8e30d3..fd413bb 100644
 --- a/games/totk/android/java/com/aure/totk/setup/SetupActivity.java
 +++ b/games/totk/android/java/com/aure/totk/setup/SetupActivity.java
+@@ -1264,3 +1264,3 @@ public final class SetupActivity extends Activity implements SetupService.Listen
+             case Settings.PERFORMANCE: keys.addAll(Arrays.asList("frame_rate", "frame_gen", "render_res", "latency", "gpu_feed")); break;
+-            case Settings.PICTURE: keys.addAll(Arrays.asList("upscaler", "sharpness", "aa", "shadows")); break;
++            case Settings.PICTURE: keys.addAll(Arrays.asList("upscaler", "sharpness", "aa", "shadows", "draw_distance")); break;
+             default:
 @@ -1268,2 +1268,3 @@ public final class SetupActivity extends Activity implements SetupService.Listen
                  if (SettingsStore.secondaryDisplay(this)) keys.add("second_screen");
 +                keys.add("ram_saver");
          }
-@@ -1473,2 +1474,5 @@ public final class SetupActivity extends Activity implements SetupService.Listen
+@@ -1395,2 +1396,3 @@ public final class SetupActivity extends Activity implements SetupService.Listen
+             case "shadows": return value.equals("high") ? 3 : value.equals("medium") ? 2 : 1;
++            case "draw_distance": return value.equals("game") ? 3 : value.equals("4000") ? 2 : 1;
+             case "console_mode": return value.equals("docked") ? 4 : 2;
+@@ -1473,2 +1475,5 @@ public final class SetupActivity extends Activity implements SetupService.Listen
                      break;
-+                case "ram_saver":
++                case "ram_saver": case "draw_distance":
 +                    fact(Strings.APPLIES, Strings.WHEN_STARTS);
 +                    break;
                  case "audio_latency":
-@@ -2371,2 +2375,5 @@ public final class SetupActivity extends Activity implements SetupService.Listen
+@@ -2371,2 +2376,5 @@ public final class SetupActivity extends Activity implements SetupService.Listen
          Widgets.Row updateRow = updateSwitch(list);
 +        // S23 fork: the last game session's log and Android's exit reasons, shared as text (no root needed).
 +        Widgets.Row logRow = listRow(list, "about:gamelog", "Share game log", "Why the game closed · for a bug report", 92, 18);
 +        logRow.setOnClickListener(v -> shareGameLog(version));
          detailPanel();
-@@ -2389,2 +2396,7 @@ public final class SetupActivity extends Activity implements SetupService.Listen
+@@ -2389,2 +2397,7 @@ public final class SetupActivity extends Activity implements SetupService.Listen
                  detailTitle.setText(Strings.UPDATES); detailText.setText(Strings.UPDATE_PRIVACY);
 +            } else if (v == logRow) {
 +                detailTitle.setText("Share game log");
@@ -441,12 +459,12 @@ index c8e30d3..64a7b97 100644
 +                        + "device's memory, the menu settings and the end of the last game session's log. Share it before "
 +                        + "starting the game again: the next start overwrites the log. No game files, keys or saves are included.");
              } else {
-@@ -2396,3 +2408,3 @@ public final class SetupActivity extends Activity implements SetupService.Listen
+@@ -2396,3 +2409,3 @@ public final class SetupActivity extends Activity implements SetupService.Listen
          versionRow.setOnFocusChangeListener(detail); licencesRow.setOnFocusChangeListener(detail); project.setOnFocusChangeListener(detail);
 -        updateRow.setOnFocusChangeListener(detail);
 +        updateRow.setOnFocusChangeListener(detail); logRow.setOnFocusChangeListener(detail);
          primary = versionRow;
-@@ -2401,2 +2413,22 @@ public final class SetupActivity extends Activity implements SetupService.Listen
+@@ -2401,2 +2414,22 @@ public final class SetupActivity extends Activity implements SetupService.Listen
  
 +    private boolean sharingGameLog;
 +    private void shareGameLog(String version) {
@@ -470,36 +488,54 @@ index c8e30d3..64a7b97 100644
 +
      /** The source commit this APK was built from: assets/build.txt ("commit <hash>", written by build_release.py). */
 diff --git a/games/totk/android/java/com/aure/totk/setup/Strings.java b/games/totk/android/java/com/aure/totk/setup/Strings.java
-index 6ce0578..0072fb7 100644
+index 6ce0578..eeab37e 100644
 --- a/games/totk/android/java/com/aure/totk/setup/Strings.java
 +++ b/games/totk/android/java/com/aure/totk/setup/Strings.java
-@@ -143,2 +143,3 @@ final class Strings {
+@@ -138,2 +138,3 @@ final class Strings {
+             case "shadows": return "Shadows";
++            case "draw_distance": return "Draw distance";
+             case "console_mode": return "Console mode";
+@@ -143,2 +144,3 @@ final class Strings {
              case "second_screen": return "Second screen";
 +            case "ram_saver": return "RAM saver";
              case "buttons": return "Button layout";
-@@ -167,2 +168,3 @@ final class Strings {
+@@ -162,2 +164,3 @@ final class Strings {
+             case "shadows": return "Lower saves GPU time in busy areas";
++            case "draw_distance": return "How far the world is drawn · fewer draws";
+             case "console_mode": return "Docked uses the game's larger TV resolution";
+@@ -167,2 +170,3 @@ final class Strings {
              case "second_screen": return "Map, inventory and shortcuts on the lower display";
 +            case "ram_saver": return "Off · On · Max: smaller caches, fewer kills";
              case "buttons": return "Which face button is the Switch's A";
-@@ -207,2 +209,6 @@ final class Strings {
+@@ -198,2 +202,5 @@ final class Strings {
+                     + "textures sharper for a little more GPU time; Off is crispest but shows the steps.";
++            case "draw_distance": return "Caps how far the camera draws the world. Shorter means fewer objects to draw each frame, "
++                    + "which eases the processor (the usual limit on phones) and needs fewer graphics buffers. Distant land is "
++                    + "cut at the horizon and far objects pop in later; what the game simulates is unchanged.";
+             case "shadows": return "The resolution of the shadow maps. Lower saves GPU time where many shadows are on screen; their "
+@@ -207,2 +214,6 @@ final class Strings {
              case "overlay_pos": return "Which corner of the screen the performance overlay sits in.";
 +            case "ram_saver": return "Keeps the app's own caches small so Android is less likely to close the game or the apps "
 +                    + "behind it. On caps texture-upload staging and preloaded shaders; Max caps them harder, reads the game "
 +                    + "image from storage instead of mapping it and builds only the shaders a scene needs. While playing, if free RAM runs low, staging is trimmed further "
 +                    + "on its own. The game's own memory is never reduced. May add short stutters the first time new areas load.";
              case "second_screen": return "On handhelds with a second display, shows the map, inventory and shortcuts on it while you "
+@@ -229,2 +240,3 @@ final class Strings {
+             case "upscaler": return upscalerName(value);
++            case "draw_distance": return value.equals("game") ? "Game default" : (Integer.parseInt(value) / 1000) + " km";
+             case "aa": return value.equals("fxaa") ? "Game (FXAA)" : value.equals("smaa") ? "SMAA" : "Off";
 diff --git a/games/totk/runtime/frontend_android.c b/games/totk/runtime/frontend_android.c
-index ce1efe5..cd2ab2e 100644
+index ce1efe5..4ad810e 100644
 --- a/games/totk/runtime/frontend_android.c
 +++ b/games/totk/runtime/frontend_android.c
 @@ -1268,2 +1268,5 @@ static const char *const settings_keys[] = {
      "TOTK_DATA_DIR",
 +    /* RAM saver (S23 fork): host-side caches only; the game's own 3.2 GiB pool is never reduced. */
 +    "TOTK_RAM_SAVER", "TOTK_VK_STAGING_RETAIN_MB", "TOTK_SEED_WARM_MB", "TOTK_ROMFS_MMAP", "TOTK_PSO_PREWARM",
-+    "TOTK_VK_REC_MEMORY_MB", "TOTK_VK_DESC_POOL_DIV",
++    "TOTK_VK_REC_MEMORY_MB", "TOTK_VK_DESC_POOL_DIV", "TOTK_FAR_CLAMP",
  };
 diff --git a/tests/test_android_settings.py b/tests/test_android_settings.py
-index 006c426..40f2c82 100644
+index 006c426..13886e2 100644
 --- a/tests/test_android_settings.py
 +++ b/tests/test_android_settings.py
 @@ -23,4 +23,13 @@ ALLOWED = {'TOTK_FPS60', 'TOTK_GPU_TIME', 'TOTK_FRAMEGEN', 'TOTK_REALTIME', 'TOT
@@ -507,7 +543,7 @@ index 006c426..40f2c82 100644
 -           'TOTK_UNCAPPED', 'TOTK_UNCAPPED_HZ', 'TOTK_UNCAPPED_INTERVAL', 'TOTK_FRAME_RATE_HINT', 'TOTK_FRAME_RATE_HINT_HZ'}
 +           'TOTK_UNCAPPED', 'TOTK_UNCAPPED_HZ', 'TOTK_UNCAPPED_INTERVAL', 'TOTK_FRAME_RATE_HINT', 'TOTK_FRAME_RATE_HINT_HZ',
 +           'TOTK_RAM_SAVER', 'TOTK_VK_STAGING_RETAIN_MB', 'TOTK_SEED_WARM_MB', 'TOTK_ROMFS_MMAP', 'TOTK_PSO_PREWARM',
-+           'TOTK_VK_REC_MEMORY_MB', 'TOTK_VK_DESC_POOL_DIV'}
++           'TOTK_VK_REC_MEMORY_MB', 'TOTK_VK_DESC_POOL_DIV', 'TOTK_FAR_CLAMP'}
  FRONTEND = TOTK / 'runtime/frontend_android.c'
 +
 +
@@ -522,7 +558,7 @@ index 006c426..40f2c82 100644
 -                    self.assertEqual(self.run_probe(f'envsocpreset {preset} {soc} en-GB')[0].replace('|', '\n'), before)
 +                    self.assertEqual(self.run_probe(f'envsocpreset {preset} {soc} en-GB')[0].replace('|', '\n'), with_ram_saver(before, soc))
                  for feed in ('off', 'on'):
-@@ -263,2 +272,13 @@ class SettingsTests(unittest.TestCase):
+@@ -263,2 +272,18 @@ class SettingsTests(unittest.TestCase):
  
 +    def test_ram_saver_levels(self):
 +        self.assertFalse(any('RAM' in l or 'SEED' in l for l in self.env(soc='QCS8550')))
@@ -535,8 +571,13 @@ index 006c426..40f2c82 100644
 +        self.assertIn('TOTK_RAM_SAVER=on', self.env(soc='SM8550'))
 +        self.assertNotIn('TOTK_RAM_SAVER=on', self.env(soc='SM8550', ram_saver='off'))
 +
++    def test_draw_distance(self):
++        self.assertFalse(any(l.startswith('TOTK_FAR_CLAMP') for l in self.env()))
++        for metres in ('4000', '2000', '1000'):
++            self.assertIn('TOTK_FAR_CLAMP=' + metres, self.env(draw_distance=metres))
++
      def test_frame_lag_only_adds_one_line_to_odin_native_sixty_bytes(self):
-@@ -291,3 +311,3 @@ class SettingsTests(unittest.TestCase):
+@@ -291,3 +316,3 @@ class SettingsTests(unittest.TestCase):
                              actual = self.run_probe(f'envsoc {soc} en-GB frame_rate={rate} frame_gen={framegen} gpu_feed={feed}')[0].replace('|', '\n')
 -                            self.assertEqual(actual.encode(), expected.encode())
 +                            self.assertEqual(actual.encode(), with_ram_saver(expected, soc).encode())
