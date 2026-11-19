@@ -1,0 +1,266 @@
+diff --git a/games/totk/android/java/com/aure/totk/RamGuard.java b/games/totk/android/java/com/aure/totk/RamGuard.java
+new file mode 100644
+index 0000000..4933f78
+--- /dev/null
++++ b/games/totk/android/java/com/aure/totk/RamGuard.java
+@@ -0,0 +1,110 @@
++package com.aure.totk;
++
++import android.app.ActivityManager;
++import android.content.Context;
++import android.os.Handler;
++import android.os.HandlerThread;
++import android.os.Process;
++import android.util.Log;
++import java.io.BufferedReader;
++import java.io.File;
++import java.io.FileOutputStream;
++import java.io.FileReader;
++import java.io.IOException;
++import java.nio.charset.StandardCharsets;
++
++/** RAM saver (S23 fork), game process side. When the menu's RAM saver is On or Max (TOTK_RAM_SAVER in settings.env),
++ * a low-priority thread checks the system's free memory every 2 s. When it falls near Android's low-memory threshold,
++ * it asks the running game, through the live switch file <game>/totk.ctl (runtime/live_ctl.h), to keep only 8 MiB of
++ * texture-upload staging per slot; when memory has been comfortable again for 30 s it returns to the launch value.
++ * Android 14+ no longer sends onTrimMemory "running low" levels to a foreground app, so this polls instead.
++ * The switch takes effect at the next presented frame, so nothing happens while the game is paused. */
++final class RamGuard {
++    private static final String TAG = "TotkRamGuard";
++    private static final long MIB = 1L << 20, PERIOD_MS = 2000, CALM_MS = 30_000;
++
++    private final ActivityManager am;
++    private final File ctl;
++    private final long margin;
++    private final HandlerThread thread = new HandlerThread("totk-ramguard", Process.THREAD_PRIORITY_BACKGROUND);
++    private final Handler handler;
++    private final ActivityManager.MemoryInfo info = new ActivityManager.MemoryInfo();
++    private boolean trimmed;
++    private long calmSince;
++    private volatile boolean closed;
++
++    private RamGuard(Context context, File gameDir, String mode) {
++        am = context.getSystemService(ActivityManager.class);
++        ctl = new File(gameDir, "totk.ctl");
++        margin = ("max".equals(mode) ? 1024 : 512) * MIB;
++        thread.start();
++        handler = new Handler(thread.getLooper());
++        handler.postDelayed(this::check, PERIOD_MS);
++        Log.i(TAG, "RAM saver " + mode + ": watching free memory (margin " + margin / MIB + " MiB), live file " + ctl);
++    }
++
++    /** Starts the watcher when settings.env (in the app's private files folder) turns the RAM saver on, else null. */
++    static RamGuard start(Context context) {
++        String mode = mode(new File(context.getFilesDir(), "settings.env"));
++        if (mode == null) return null;
++        try {
++            File game = com.aure.totk.setup.StorageLocation.gameDir(context);
++            return new RamGuard(context, game, mode);
++        } catch (RuntimeException failed) {
++            Log.w(TAG, "RAM saver watcher not started", failed);
++            return null;
++        }
++    }
++    private static String mode(File env) {
++        try (BufferedReader in = new BufferedReader(new FileReader(env))) {
++            String mode = null;
++            for (String line; (line = in.readLine()) != null; )
++                if (line.startsWith("TOTK_RAM_SAVER=")) mode = line.substring(15).trim();
++            return "on".equals(mode) || "max".equals(mode) ? mode : null;
++        } catch (IOException missing) {
++            return null;
++        }
++    }
++
++    private void check() {
++        if (closed) return;
++        try {
++            am.getMemoryInfo(info);
++            long now = android.os.SystemClock.uptimeMillis();
++            boolean tight = info.lowMemory || info.availMem < info.threshold + margin;
++            boolean comfortable = info.availMem > info.threshold + 2 * margin;
++            if (tight && !trimmed) {
++                if (write("set TOTK_VK_STAGING_RETAIN_MB=8\n")) {
++                    trimmed = true;
++                    Log.i(TAG, "free RAM " + info.availMem / MIB + " MiB (threshold " + info.threshold / MIB + "): staging trimmed");
++                }
++                calmSince = 0;
++            } else if (trimmed) {
++                if (!comfortable) calmSince = 0;
++                else if (calmSince == 0) calmSince = now;
++                else if (now - calmSince >= CALM_MS && write("unset TOTK_VK_STAGING_RETAIN_MB\n")) {
++                    trimmed = false; calmSince = 0;
++                    Log.i(TAG, "free RAM " + info.availMem / MIB + " MiB: staging back to its launch value");
++                }
++            }
++        } catch (RuntimeException failed) {
++            Log.w(TAG, "memory check failed", failed);
++        }
++        if (!closed) handler.postDelayed(this::check, PERIOD_MS);
++    }
++    /** Appends one complete line (one write) to totk.ctl; the game's reader stages only appended complete lines. */
++    private boolean write(String line) {
++        try (FileOutputStream out = new FileOutputStream(ctl, true)) {
++            out.write(line.getBytes(StandardCharsets.UTF_8));
++            return true;
++        } catch (IOException | SecurityException failed) {
++            Log.w(TAG, "could not write " + ctl, failed);
++            return false;
++        }
++    }
++    void close() {
++        closed = true;
++        handler.removeCallbacksAndMessages(null);
++        thread.quitSafely();
++    }
++}
+diff --git a/games/totk/android/java/com/aure/totk/TotkActivity.java b/games/totk/android/java/com/aure/totk/TotkActivity.java
+index 968cf89..3cf93f0 100644
+--- a/games/totk/android/java/com/aure/totk/TotkActivity.java
++++ b/games/totk/android/java/com/aure/totk/TotkActivity.java
+@@ -25,2 +25,4 @@ public final class TotkActivity extends NativeActivity {
+     private SaveMirror.Watcher saves;
++    /** RAM saver (S23 fork): trims the game's caches live when free memory runs low (null when off). */
++    private RamGuard ramGuard;
+     private AttachedSurfaceControl presentRoot;
+@@ -151,2 +153,3 @@ public final class TotkActivity extends NativeActivity {
+         saves = SaveMirror.Watcher.start(this);
++        ramGuard = RamGuard.start(this);
+         int given = nativeFeedbackEnabled();   // what start_game gave the game (TOTK_RUMBLE / TOTK_GYRO and the hardware)
+@@ -230,2 +233,3 @@ public final class TotkActivity extends NativeActivity {
+         if (saves != null) { saves.close(1500); saves = null; }
++        if (ramGuard != null) { ramGuard.close(); ramGuard = null; }
+         if (feedback != null) { feedback.close(); feedback = null; }
+diff --git a/games/totk/android/java/com/aure/totk/setup/Diagram.java b/games/totk/android/java/com/aure/totk/setup/Diagram.java
+index b330096..c3cdc35 100644
+--- a/games/totk/android/java/com/aure/totk/setup/Diagram.java
++++ b/games/totk/android/java/com/aure/totk/setup/Diagram.java
+@@ -34,3 +34,3 @@ final class Diagram extends View {
+             case "game_language": return 170;
+-            case "gpu_feed": case "rumble": case "motion": return 0;   // text and facts only
++            case "gpu_feed": case "rumble": case "motion": case "ram_saver": return 0;   // text and facts only
+             default: return 300;
+diff --git a/games/totk/android/java/com/aure/totk/setup/Settings.java b/games/totk/android/java/com/aure/totk/setup/Settings.java
+index 98f533d..824cffc 100644
+--- a/games/totk/android/java/com/aure/totk/setup/Settings.java
++++ b/games/totk/android/java/com/aure/totk/setup/Settings.java
+@@ -50,2 +50,3 @@ final class Settings {
+         new Option("second_screen", SCREEN, "on", "off", "on"),
++        new Option("ram_saver", SCREEN, "off", "off", "on", "max"),
+         new Option("buttons", CONTROLS, "nintendo", "nintendo", "xbox"),
+@@ -90,2 +91,4 @@ final class Settings {
+         if (stored == null || !stored.containsKey("gpu_feed")) values.put("gpu_feed", gpuFeedDefault(soc));
++        // RAM saver (S23 fork): a store without the key adopts the chip default; explicit choices win.
++        if (stored == null || !stored.containsKey("ram_saver")) values.put("ram_saver", ramSaverDefault(soc));
+     }
+@@ -190,2 +193,7 @@ final class Settings {
+     }
++    /** RAM saver default: On for phones with the Snapdragon 8 Gen 2 (SM8550: Galaxy S23 series and similar), whose
++     * Android keeps far more running than a handheld; Off elsewhere (the AYN Thor reports QCS8550). */
++    static String ramSaverDefault(String soc) {
++        return "SM8550".equals(socToken(soc)) ? "on" : "off";
++    }
+     /** Whether profile(soc) is backed by a device test (the "Recommended for this device" badge). */
+@@ -202,2 +210,3 @@ final class Settings {
+         if (tab.equals(PERFORMANCE)) values.put("gpu_feed", gpuFeedDefault(soc));
++        if (tab.equals(SCREEN)) values.put("ram_saver", ramSaverDefault(soc));
+     }
+@@ -267,2 +276,14 @@ final class Settings {
+         line(out, "TOTK_COMPANION=" + (get("second_screen").equals("on") ? "1" : "0"));
++        // RAM saver: caps only the app's own caches (texture-upload staging, preloaded shaders); the game's memory pool
++        // is never reduced. TOTK_RAM_SAVER is read by RamGuard in the game process (live trims under memory pressure).
++        switch (get("ram_saver")) {
++            case "on":
++                line(out, "TOTK_RAM_SAVER=on"); line(out, "TOTK_VK_STAGING_RETAIN_MB=96"); line(out, "TOTK_SEED_WARM_MB=48");
++                break;
++            case "max":
++                line(out, "TOTK_RAM_SAVER=max"); line(out, "TOTK_VK_STAGING_RETAIN_MB=32"); line(out, "TOTK_SEED_WARM_MB=16");
++                line(out, "TOTK_ROMFS_MMAP=0");
++                break;
++            default: break;
++        }
+         line(out, "TOTK_FACE_BUTTONS=" + (get("buttons").equals("xbox") ? "position" : "label"));
+diff --git a/games/totk/android/java/com/aure/totk/setup/SetupActivity.java b/games/totk/android/java/com/aure/totk/setup/SetupActivity.java
+index c8e30d3..b3c9b5f 100644
+--- a/games/totk/android/java/com/aure/totk/setup/SetupActivity.java
++++ b/games/totk/android/java/com/aure/totk/setup/SetupActivity.java
+@@ -1268,2 +1268,3 @@ public final class SetupActivity extends Activity implements SetupService.Listen
+                 if (SettingsStore.secondaryDisplay(this)) keys.add("second_screen");
++                keys.add("ram_saver");
+         }
+@@ -1473,2 +1474,5 @@ public final class SetupActivity extends Activity implements SetupService.Listen
+                     break;
++                case "ram_saver":
++                    fact(Strings.APPLIES, Strings.WHEN_STARTS);
++                    break;
+                 case "audio_latency":
+diff --git a/games/totk/android/java/com/aure/totk/setup/Strings.java b/games/totk/android/java/com/aure/totk/setup/Strings.java
+index 6ce0578..cc18dc6 100644
+--- a/games/totk/android/java/com/aure/totk/setup/Strings.java
++++ b/games/totk/android/java/com/aure/totk/setup/Strings.java
+@@ -143,2 +143,3 @@ final class Strings {
+             case "second_screen": return "Second screen";
++            case "ram_saver": return "RAM saver";
+             case "buttons": return "Button layout";
+@@ -167,2 +168,3 @@ final class Strings {
+             case "second_screen": return "Map, inventory and shortcuts on the lower display";
++            case "ram_saver": return "Off · On · Max: smaller caches, fewer kills";
+             case "buttons": return "Which face button is the Switch's A";
+@@ -207,2 +209,6 @@ final class Strings {
+             case "overlay_pos": return "Which corner of the screen the performance overlay sits in.";
++            case "ram_saver": return "Keeps the app's own caches small so Android is less likely to close the game or the apps "
++                    + "behind it. On caps texture-upload staging and preloaded shaders; Max caps them harder and reads the game "
++                    + "image from storage instead of mapping it. While playing, if free RAM runs low, staging is trimmed further "
++                    + "on its own. The game's own memory is never reduced. May add short stutters the first time new areas load.";
+             case "second_screen": return "On handhelds with a second display, shows the map, inventory and shortcuts on it while you "
+diff --git a/games/totk/runtime/frontend_android.c b/games/totk/runtime/frontend_android.c
+index ce1efe5..99721b3 100644
+--- a/games/totk/runtime/frontend_android.c
++++ b/games/totk/runtime/frontend_android.c
+@@ -1268,2 +1268,4 @@ static const char *const settings_keys[] = {
+     "TOTK_DATA_DIR",
++    /* RAM saver (S23 fork): host-side caches only; the game's own 3.2 GiB pool is never reduced. */
++    "TOTK_RAM_SAVER", "TOTK_VK_STAGING_RETAIN_MB", "TOTK_SEED_WARM_MB", "TOTK_ROMFS_MMAP",
+ };
+diff --git a/tests/test_android_settings.py b/tests/test_android_settings.py
+index 006c426..e84293a 100644
+--- a/tests/test_android_settings.py
++++ b/tests/test_android_settings.py
+@@ -23,4 +23,12 @@ ALLOWED = {'TOTK_FPS60', 'TOTK_GPU_TIME', 'TOTK_FRAMEGEN', 'TOTK_REALTIME', 'TOT
+            'TOTK_AUTOLOAD', 'TOTK_VK_SPLIT_PASS_DRAWS', 'TOTK_ADPF_GPU', 'TOTK_FPS60_HYSTERESIS',
+-           'TOTK_UNCAPPED', 'TOTK_UNCAPPED_HZ', 'TOTK_UNCAPPED_INTERVAL', 'TOTK_FRAME_RATE_HINT', 'TOTK_FRAME_RATE_HINT_HZ'}
++           'TOTK_UNCAPPED', 'TOTK_UNCAPPED_HZ', 'TOTK_UNCAPPED_INTERVAL', 'TOTK_FRAME_RATE_HINT', 'TOTK_FRAME_RATE_HINT_HZ',
++           'TOTK_RAM_SAVER', 'TOTK_VK_STAGING_RETAIN_MB', 'TOTK_SEED_WARM_MB', 'TOTK_ROMFS_MMAP'}
+ FRONTEND = TOTK / 'runtime/frontend_android.c'
++
++
++def with_ram_saver(env, soc):
++    """S23 fork: phones with the SM8550 chip start with the RAM saver On, which adds three lines after TOTK_COMPANION."""
++    if soc != 'SM8550':
++        return env
++    return env.replace('TOTK_COMPANION=1\n', 'TOTK_COMPANION=1\nTOTK_RAM_SAVER=on\nTOTK_VK_STAGING_RETAIN_MB=96\nTOTK_SEED_WARM_MB=48\n')
+ FRAMEGEN = ['TOTK_FPS60=0', 'TOTK_FRAMEGEN=locked', 'TOTK_REALTIME=1', 'TOTK_FRAME_LAG=0', 'TOTK_FPS_AUTO=0', 'DM_PRESENT_HZ=60',
+@@ -224,3 +232,3 @@ class SettingsTests(unittest.TestCase):
+                 for soc in ('QCS8550', 'QCM8550', 'SM8550', 'CQ7790S', 'CQ7790M', 'SM7750', 'unknown', 'SM8650', 'XSM8750', 'CQ8725SA'):
+-                    self.assertEqual(self.run_probe(f'envsocpreset {preset} {soc} en-GB')[0].replace('|', '\n'), before)
++                    self.assertEqual(self.run_probe(f'envsocpreset {preset} {soc} en-GB')[0].replace('|', '\n'), with_ram_saver(before, soc))
+                 for feed in ('off', 'on'):
+@@ -263,2 +271,13 @@ class SettingsTests(unittest.TestCase):
+ 
++    def test_ram_saver_levels(self):
++        self.assertFalse(any('RAM' in l or 'SEED' in l for l in self.env(soc='QCS8550')))
++        self.assertEqual(self.env(ram_saver='off'), self.env())
++        on = self.env(ram_saver='on')
++        self.assertIn('TOTK_RAM_SAVER=on', on); self.assertIn('TOTK_VK_STAGING_RETAIN_MB=96', on); self.assertIn('TOTK_SEED_WARM_MB=48', on)
++        mx = self.env(ram_saver='max')
++        for line in ('TOTK_RAM_SAVER=max', 'TOTK_VK_STAGING_RETAIN_MB=32', 'TOTK_SEED_WARM_MB=16', 'TOTK_ROMFS_MMAP=0'):
++            self.assertIn(line, mx)
++        self.assertIn('TOTK_RAM_SAVER=on', self.env(soc='SM8550'))
++        self.assertNotIn('TOTK_RAM_SAVER=on', self.env(soc='SM8550', ram_saver='off'))
++
+     def test_frame_lag_only_adds_one_line_to_odin_native_sixty_bytes(self):
+@@ -291,3 +310,3 @@ class SettingsTests(unittest.TestCase):
+                             actual = self.run_probe(f'envsoc {soc} en-GB frame_rate={rate} frame_gen={framegen} gpu_feed={feed}')[0].replace('|', '\n')
+-                            self.assertEqual(actual.encode(), expected.encode())
++                            self.assertEqual(actual.encode(), with_ram_saver(expected, soc).encode())
+             first = self.run_probe(f'envfirst {soc} en-GB')[0].replace('|', '\n')
