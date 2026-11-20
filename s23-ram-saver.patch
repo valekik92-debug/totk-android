@@ -1,12 +1,26 @@
 diff --git a/games/totk/android/gfx/nvn_vk.c b/games/totk/android/gfx/nvn_vk.c
-index 956f3fb..3ac3c22 100644
+index 956f3fb..7110995 100644
 --- a/games/totk/android/gfx/nvn_vk.c
 +++ b/games/totk/android/gfx/nvn_vk.c
-@@ -908,2 +908,3 @@ static void vk_init_once(void) {
+@@ -533,2 +533,5 @@ void vk_rec_profile_present(uint64_t frame) {
+ static PFN_vkGetInstanceProcAddr gipa;
++/* S23 fork diagnostics: VK_EXT_memory_budget (the driver's own count of this process's GPU memory per heap). */
++static PFN_vkGetPhysicalDeviceMemoryProperties2 g_gpmp2;
++static int g_mem_budget;
+ static PFN_vkGetCalibratedTimestampsEXT g_calibrated_timestamps;
+@@ -699,2 +702,3 @@ static void vk_init_once(void) {
+     V.get_format_props = (PFN_vkGetPhysicalDeviceFormatProperties)gipa(V.inst, "vkGetPhysicalDeviceFormatProperties");
++    g_gpmp2 = (PFN_vkGetPhysicalDeviceMemoryProperties2)gipa(V.inst, "vkGetPhysicalDeviceMemoryProperties2");
+     V.get_image_format_props = (PFN_vkGetPhysicalDeviceImageFormatProperties)gipa(V.inst, "vkGetPhysicalDeviceImageFormatProperties");
+@@ -904,2 +908,3 @@ static void vk_init_once(void) {
+ #endif
++    if (g_gpmp2 && has_ext("VK_EXT_memory_budget") && ne < 32) { exts[ne++] = "VK_EXT_memory_budget"; g_mem_budget = 1; }   /* S23 diagnostics */
+     float prio = 1;
+@@ -908,2 +913,3 @@ static void vk_init_once(void) {
      VKCHECK(vkCreateDevice(V.pd, &dci, NULL, &V.dev));
 +    vk_desc_pool_sizes_init();   /* S23 fork: TOTK_VK_DESC_POOL_DIV, before any layout or pool */
  #define DL(name) name = (PFN_##name)vkGetDeviceProcAddr(V.dev, #name);
-@@ -6527,4 +6528,6 @@ void vk_mem_report(void) {
+@@ -6527,4 +6533,25 @@ void vk_mem_report(void) {
      uint64_t r[8]; vk_res_mem(r);
 -    LOGV("memory image blocks: used/free %.3f/%.3f MiB (empty blocks retained for reuse)",
 -        r[7] / 1048576.0, (r[0] - r[7]) / 1048576.0);
@@ -14,6 +28,25 @@ index 956f3fb..3ac3c22 100644
 +    LOGV("memory image blocks: used/free %.3f/%.3f MiB (%s); half textures made %llu, made whole again %llu (TOTK_HALF_TEXTURES)",
 +        r[7] / 1048576.0, (r[0] - r[7]) / 1048576.0, rb && !strcmp(rb, "1") ? "empty blocks beyond one spare released" : "empty blocks retained for reuse",
 +        (unsigned long long)half[0], (unsigned long long)half[1]); }
++    {   /* S23 fork diagnostics: GPU memory as the driver counts it, the pipeline cache held in RAM, malloc's own split */
++        char heaps[256] = ""; size_t hl = 0;
++        if (g_mem_budget) {
++            VkPhysicalDeviceMemoryBudgetPropertiesEXT bp = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
++            VkPhysicalDeviceMemoryProperties2 mp2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, &bp};
++            g_gpmp2(V.pd, &mp2);
++            for (uint32_t h = 0; h < mp2.memoryProperties.memoryHeapCount && h < 4 && hl < sizeof heaps - 64; h++)
++                hl += (size_t)snprintf(heaps + hl, sizeof heaps - hl, " heap%u %llu/%llu MiB", h,
++                    (unsigned long long)(bp.heapUsage[h] >> 20), (unsigned long long)(bp.heapBudget[h] >> 20));
++        } else snprintf(heaps, sizeof heaps, " (VK_EXT_memory_budget unavailable)");
++        size_t pc = 0; if (V.pcache) vkGetPipelineCacheData(V.dev, V.pcache, &pc, NULL);
++#ifdef __GLIBC__
++        struct mallinfo2 md = mallinfo2();
++#else
++        struct mallinfo md = mallinfo();
++#endif
++        LOGV("memory diag: GPU used/budget%s; pipeline cache %zu KiB; malloc arena %zu MiB, mmapped %zu MiB, free in arena %zu MiB",
++             heaps, pc >> 10, (size_t)md.arena >> 20, (size_t)md.hblkhd >> 20, (size_t)md.fordblks >> 20);
++    }
  #ifdef __GLIBC__
 diff --git a/games/totk/android/gfx/vk_draw.c b/games/totk/android/gfx/vk_draw.c
 index 09993ed..b72f42b 100644
@@ -258,10 +291,10 @@ index 4b76828..bc59528 100644
      unsigned s0 = v && v->set_layers ? v->min_layer : 0;
 diff --git a/games/totk/android/java/com/aure/totk/RamGuard.java b/games/totk/android/java/com/aure/totk/RamGuard.java
 new file mode 100644
-index 0000000..b57b5ef
+index 0000000..573a48b
 --- /dev/null
 +++ b/games/totk/android/java/com/aure/totk/RamGuard.java
-@@ -0,0 +1,160 @@
+@@ -0,0 +1,233 @@
 +package com.aure.totk;
 +
 +import android.app.ActivityManager;
@@ -364,7 +397,80 @@ index 0000000..b57b5ef
 +            try { write("mark mem1: " + memLine() + "\nmark mem2: " + gpuLine() + "\n"); }
 +            catch (RuntimeException failed) { Log.w(TAG, "memory snapshot failed", failed); }
 +        }
++        // Every 60 s (diagnostics): the system's memory and where this process's resident and swapped memory sits.
++        if (ticks % 30 == 0) {
++            try { write(meminfoLine()); for (String l : smapsLines()) write(l); }
++            catch (RuntimeException failed) { Log.w(TAG, "smaps snapshot failed", failed); }
++        }
 +        if (!closed) handler.postDelayed(this::check, PERIOD_MS);
++    }
++
++    /** System totals, MiB (/proc/meminfo: kB), and the KGSL driver's page pool where readable. */
++    private String meminfoLine() {
++        StringBuilder out = new StringBuilder("mark meminfo:");
++        for (String line : lines("/proc/meminfo", 64)) {
++            for (String key : new String[]{"MemFree", "MemAvailable", "Cached", "Shmem", "AnonPages", "SwapTotal", "SwapFree", "Mapped", "KReclaimable"}) {
++                if (line.startsWith(key + ":")) {
++                    try { out.append(' ').append(key).append('=').append(Long.parseLong(line.substring(key.length() + 1).trim().split("\\s+")[0]) >> 10); }
++                    catch (NumberFormatException ignored) { }
++                }
++            }
++        }
++        List<String> pool = lines("/sys/class/kgsl/kgsl/page_alloc", 1);
++        if (!pool.isEmpty()) try { out.append(" kgsl_pages=").append(Long.parseLong(pool.get(0).trim()) / MIB); } catch (NumberFormatException ignored) { }
++        return out.append('\n').toString();
++    }
++    /** /proc/self/smaps summed by mapping kind: resident and swapped MiB of the 12 largest, as several short lines. */
++    private List<String> smapsLines() {
++        java.util.HashMap<String, long[]> kinds = new java.util.HashMap<>();
++        long[] cur = null;
++        try (BufferedReader in = new BufferedReader(new FileReader("/proc/self/smaps"), 1 << 16)) {
++            for (String line; (line = in.readLine()) != null; ) {
++                char c = line.isEmpty() ? ' ' : line.charAt(0);
++                boolean header = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
++                if (header && line.indexOf('-') > 0 && line.indexOf('-') < 17) {
++                    String[] f = line.split("\\s+", 6);
++                    String kind = kind(f.length > 5 ? f[5].trim() : "");
++                    cur = kinds.get(kind);
++                    if (cur == null) { cur = new long[2]; kinds.put(kind, cur); }
++                } else if (cur != null && line.startsWith("Rss:")) cur[0] += kb(line);
++                else if (cur != null && line.startsWith("Swap:")) cur[1] += kb(line);
++            }
++        } catch (IOException | SecurityException unavailable) {
++            List<String> none = new ArrayList<>(); none.add("mark smaps: unavailable\n"); return none;
++        }
++        List<java.util.Map.Entry<String, long[]>> all = new ArrayList<>(kinds.entrySet());
++        all.sort((a, b) -> Long.compare(b.getValue()[0] + b.getValue()[1], a.getValue()[0] + a.getValue()[1]));
++        List<String> out = new ArrayList<>();
++        StringBuilder line = new StringBuilder("mark smaps rss/swap MiB:");
++        for (int i = 0; i < all.size() && i < 12; i++) {
++            long[] v = all.get(i).getValue();
++            String item = " " + all.get(i).getKey() + "=" + (v[0] >> 10) + "/" + (v[1] >> 10);
++            if (line.length() + item.length() > 200) { out.add(line.append('\n').toString()); line = new StringBuilder("mark smaps+:"); }
++            line.append(item);
++        }
++        out.add(line.append('\n').toString());
++        return out;
++    }
++    private static long kb(String line) {
++        try { return Long.parseLong(line.substring(line.indexOf(':') + 1).trim().split("\\s+")[0]); }
++        catch (RuntimeException bad) { return 0; }
++    }
++    /** A mapping's name reduced to its kind: one entry per allocator, library family or shared-memory object. */
++    private static String kind(String name) {
++        if (name.isEmpty()) return "anon";
++        String n = name.replace(' ', '_');
++        if (n.startsWith("[anon:scudo:")) return n.substring(6, n.length() - 1);
++        if (n.startsWith("[anon:dalvik-") || n.contains("dalvik")) return "dalvik";
++        if (n.startsWith("[anon:stack_and_tls") || n.startsWith("[stack")) return "stacks";
++        if (n.startsWith("[anon:")) { int c = n.indexOf(':', 6); return n.substring(1, c > 0 ? c : n.length() - 1); }
++        if (n.startsWith("/memfd:") || n.startsWith("/dmabuf")) { int e = n.indexOf('_', 1); String k = e > 0 ? n.substring(1, e) : n.substring(1); return k.length() > 28 ? k.substring(0, 28) : k; }
++        if (n.startsWith("/dev/")) return n.substring(5).replaceAll("[0-9]+$", "");
++        if (n.endsWith(".so")) return n.startsWith("/data/") ? "app-libs" : "sys-libs";
++        if (n.endsWith(".apk") || n.endsWith(".odex") || n.endsWith(".vdex") || n.endsWith(".art") || n.endsWith(".oat") || n.endsWith(".jar")) return "art-apk";
++        if (n.startsWith("/data/")) return "data-files";
++        if (n.startsWith("[")) return n.substring(1, n.length() - 1);
++        return "other-files";
 +    }
 +
 +    /** System free memory and this process's resident memory by kind, MiB (/proc/self/status: kB). */
@@ -455,10 +561,10 @@ index b330096..ee5e01d 100644
          RectF scene = new RectF(x0, y0 + sh * (1 - k), x0 + sw * k, y0 + sh);
 diff --git a/games/totk/android/java/com/aure/totk/setup/GameReport.java b/games/totk/android/java/com/aure/totk/setup/GameReport.java
 new file mode 100644
-index 0000000..add2591
+index 0000000..2714fb2
 --- /dev/null
 +++ b/games/totk/android/java/com/aure/totk/setup/GameReport.java
-@@ -0,0 +1,127 @@
+@@ -0,0 +1,134 @@
 +package com.aure.totk.setup;
 +
 +import android.app.ActivityManager;
@@ -481,7 +587,7 @@ index 0000000..add2591
 +final class GameReport {
 +    private GameReport() { }
 +    /** The end of totk.log kept in the report: share sheets and chat apps refuse very long text. */
-+    private static final int LOG_TAIL_BYTES = 48 * 1024;
++    private static final int LOG_TAIL_BYTES = 24 * 1024;
 +
 +    static String build(Context context, String appVersion) {
 +        StringBuilder out = new StringBuilder();
@@ -512,7 +618,7 @@ index 0000000..add2591
 +        File prev = game == null ? null : new File(game, "totk.prev.log");
 +        String which = "the last game session";
 +        if (log != null && prev.isFile() && (!log.isFile() || log.length() < 256 * 1024)) { log = prev; which = "the session before the last, short one"; }
-+        if (log != null) out.append("\n== Memory lines from ").append(which).append(" (last 40) ==\n").append(memoryLines(log));
++        if (log != null) out.append("\n== Memory lines from ").append(which).append(" (start and end) ==\n").append(memoryLines(log));
 +        out.append("\n== ").append(log == null ? "totk.log" : log.getName()).append(" (last ").append(LOG_TAIL_BYTES / 1024)
 +                .append(" KiB of ").append(which).append(") ==\n");
 +        out.append(log == null ? "(game folder unknown)\n" : tail(log, LOG_TAIL_BYTES));
@@ -554,14 +660,19 @@ index 0000000..add2591
 +            default: return "UNKNOWN";
 +        }
 +    }
-+    /** The RAM saver's marks and the backend's memory reports from anywhere in the log, so a short tail still has them. */
++    /** The memory timeline from anywhere in the log (diagnostics): the first 20 lines (the start of the session, a
++     * baseline) and the last 100, so a short tail still has them. */
 +    private static String memoryLines(File log) {
++        java.util.ArrayList<String> first = new java.util.ArrayList<>();
 +        java.util.ArrayDeque<String> keep = new java.util.ArrayDeque<>();
++        long skipped = 0;
 +        try (java.io.BufferedReader in = new java.io.BufferedReader(new java.io.FileReader(log))) {
 +            for (String line; (line = in.readLine()) != null; ) {
-+                if (line.contains("mark mem") || line.contains("mark ram-saver") || line.startsWith("[nvn-vk] memory")
-+                        || line.contains("descriptors frame") || line.contains("recorder storage:")) {
-+                    if (keep.size() == 40) keep.removeFirst();
++                if (line.contains("mark mem1") || line.contains("mark ram-saver") || line.contains("memory image blocks")
++                        || line.contains("memory: malloc") || line.contains("memory diag") || line.contains("mark smaps")
++                        || line.contains("mark meminfo") || line.contains(" fps over the last 300")) {
++                    if (first.size() < 20) { first.add(line); continue; }
++                    if (keep.size() == 100) { keep.removeFirst(); skipped++; }
 +                    keep.addLast(line);
 +                }
 +            }
@@ -569,8 +680,10 @@ index 0000000..add2591
 +            return "(" + missing.getMessage() + ")\n";
 +        }
 +        StringBuilder out = new StringBuilder();
++        for (String line : first) out.append(line).append('\n');
++        if (skipped > 0) out.append("(… ").append(skipped).append(" lines omitted)\n");
 +        for (String line : keep) out.append(line).append('\n');
-+        return keep.isEmpty() ? "(none)\n" : out.toString();
++        return first.isEmpty() ? "(none)\n" : out.toString();
 +    }
 +    /** The last max bytes of a file as text, starting at a line boundary. */
 +    private static String tail(File file, int max) {
