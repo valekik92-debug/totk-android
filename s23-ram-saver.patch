@@ -16,31 +16,37 @@ index 956f3fb..3ac3c22 100644
 +        (unsigned long long)half[0], (unsigned long long)half[1]); }
  #ifdef __GLIBC__
 diff --git a/games/totk/android/gfx/vk_draw.c b/games/totk/android/gfx/vk_draw.c
-index 09993ed..965acde 100644
+index 09993ed..b72f42b 100644
 --- a/games/totk/android/gfx/vk_draw.c
 +++ b/games/totk/android/gfx/vk_draw.c
-@@ -6076,2 +6076,3 @@ static void copy_b2t(const p_copy_b2t *c) {   /* buffer -> texture (row stride f
+@@ -6083,2 +6083,6 @@ static void copy_b2t(const p_copy_b2t *c) {   /* buffer -> texture (row stride f
+     size_t row = S.copy_stride ? (size_t)S.copy_stride : (size_t)((c->r.width + bw - 1) / bw) * bpb, rows = (c->r.height + bh - 1) / bh, img = row * rows;
++    if (vk_tex_skip(x)) {   /* TOTK_HALF_TEXTURES: the image starts at the guest's second level */
++        if (level < vk_tex_skip(x)) { vk_tex_half_drop("buffer-to-texture copy"); return; }
++        level -= vk_tex_skip(x);
++    }
+     int nz = c->r.depth ? c->r.depth : 1, is3d = vk_tex_is3d(x);
+@@ -6135,2 +6139,3 @@ static void copy_t2b(const p_copy_b2t *c) {   /* texture -> buffer */
      }
 +    vk_tex_make_whole(x);
      int bw, bh, bpb = nvn_fmt_bpb(c->tex->d.format, &bw, &bh);
-@@ -6135,2 +6136,3 @@ static void copy_t2b(const p_copy_b2t *c) {   /* texture -> buffer */
-     }
-+    vk_tex_make_whole(x);
-     int bw, bh, bpb = nvn_fmt_bpb(c->tex->d.format, &bw, &bh);
-@@ -6200,2 +6202,3 @@ static void copy_t2t(const p_copy_t2t *c) {   /* texture -> texture: same size a
-     }
-+    vk_tex_make_whole(s); vk_tex_make_whole(d);
+@@ -6201,2 +6206,4 @@ static void copy_t2t(const p_copy_t2t *c) {   /* texture -> texture: same size a
      unsigned sl = vlevel(&c->sv, c->has_sv), dl = vlevel(&c->dv, c->has_dv), sz0 = vlayer(&c->sv, c->has_sv), dz0 = vlayer(&c->dv, c->has_dv);
-@@ -6354,2 +6357,3 @@ static void clear_tex(const p_clear_tex *c) {   /* clear a texture region with a
++    if (vk_tex_skip(s)) { if (sl < vk_tex_skip(s)) vk_tex_make_whole(s); else sl -= vk_tex_skip(s); }   /* TOTK_HALF_TEXTURES */
++    if (vk_tex_skip(d)) { if (dl < vk_tex_skip(d)) { vk_tex_half_drop("texture copy"); return; } dl -= vk_tex_skip(d); }
+     int s3 = vk_tex_is3d(s), d3 = vk_tex_is3d(d), nz = c->sr.depth ? c->sr.depth : 1;
+@@ -6354,2 +6361,3 @@ static void clear_tex(const p_clear_tex *c) {   /* clear a texture region with a
      vk_tex *x = vk_tex_get(c->tex); if (!x) return;
 +    vk_tex_make_whole(x);
      unsigned lv = vlevel(&c->view, c->has_view), l0 = vlayer(&c->view, c->has_view);
 diff --git a/games/totk/android/gfx/vk_int.h b/games/totk/android/gfx/vk_int.h
-index eefcc8f..03a2fec 100644
+index eefcc8f..3473211 100644
 --- a/games/totk/android/gfx/vk_int.h
 +++ b/games/totk/android/gfx/vk_int.h
-@@ -470,2 +470,4 @@ int vk_tex_nvn_format(vk_tex *x);
+@@ -470,2 +470,6 @@ int vk_tex_nvn_format(vk_tex *x);
  uint32_t vk_tex_width(vk_tex *x, unsigned level);
++uint32_t vk_tex_skip(vk_tex *x);   /* TOTK_HALF_TEXTURES: guest levels missing from the image (0 or 1) */
++void vk_tex_half_drop(const char *op);
 +void vk_tex_make_whole(vk_tex *x);   /* TOTK_HALF_TEXTURES: full size before a GPU copy touches it */
 +void vk_res_half_stats(uint64_t out[2]);   /* TOTK_HALF_TEXTURES: textures made half, made whole again */
  uint32_t vk_tex_height(vk_tex *x, unsigned level);
@@ -88,7 +94,7 @@ index 6b559bc..2956039 100644
 +void vk_desc_pool_sizes_init(void);
  int vk_desc_layout_fits(const VkDescriptorSetLayoutBinding *bindings, uint32_t count, char *why, size_t size);
 diff --git a/games/totk/android/gfx/vk_res.c b/games/totk/android/gfx/vk_res.c
-index 4b76828..caab5b6 100644
+index 4b76828..69e5c9a 100644
 --- a/games/totk/android/gfx/vk_res.c
 +++ b/games/totk/android/gfx/vk_res.c
 @@ -94,2 +94,10 @@ static pthread_mutex_t g_mem_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -164,7 +170,7 @@ index 4b76828..caab5b6 100644
 -    vk_img *old = x->im, *nu = img_create_ex(&x->t, 1);
 +    vk_img *old = x->im; t_half_req = old->skip != 0; vk_img *nu = img_create_ex(&x->t, 1); t_half_req = 0;
      if (!nu) return 0;
-@@ -556,2 +599,29 @@ static int img_upgrade_inner(vk_tex *x, VkFormat want) {
+@@ -556,2 +599,35 @@ static int img_upgrade_inner(vk_tex *x, VkFormat want) {
  static int img_upgrade(vk_tex *x, VkFormat want) { return VK_REC_VALUE(VK_REC_S_RESOURCE, img_upgrade_inner(x, want)); }
 +static void upload(vk_tex *x);
 +/* TOTK_HALF_TEXTURES: a half image the GPU is about to write, copy or render: made again at full size from the guest's
@@ -189,28 +195,43 @@ index 4b76828..caab5b6 100644
 +    return 1;
 +}
 +void vk_res_half_stats(uint64_t out[2]) { pthread_mutex_lock(&g_tex_mu); out[0] = g_stat_half; out[1] = g_stat_unhalve; pthread_mutex_unlock(&g_tex_mu); }
++uint32_t vk_tex_skip(vk_tex *x) { return x && x->im ? x->im->skip : 0; }
++static _Atomic uint64_t g_stat_half_drops;
++void vk_tex_half_drop(const char *op) {   /* a copy into a half texture's missing first level: not needed, dropped */
++    uint64_t n = atomic_fetch_add(&g_stat_half_drops, 1) + 1;
++    if (n <= 4 || !(n & (n - 1))) LOGV("half texture: %s into the dropped first level skipped (%llu so far)", op, (unsigned long long)n);
++}
 +void vk_tex_make_whole(vk_tex *x) {
 +    if (!x || !x->im || !x->im->skip) return;
 +    pthread_mutex_lock(&g_tex_mu); img_unhalve_locked(x); pthread_mutex_unlock(&g_tex_mu);
 +}
  
-@@ -644,4 +714,4 @@ static void upload_inner(vk_tex *x) {
+@@ -644,4 +720,4 @@ static void upload_inner(vk_tex *x) {
              if (linear) { size_t stride = nvn_tex_linear_stride(&t->d); bad = 0; for (size_t r = 0; r < rows * z; r++) memcpy(stg + off + r * pitch, t->mem + r * stride, pitch); }
 -            else if (pooled) { subs[ns++] = (upload_sub){l, y, stg + off, pitch}; bad = 0; }
 -            else bad = nvn_deswizzle(&t->d, l, y, t->mem, stg + off, pitch);
 +            else if (pooled) { subs[ns++] = (upload_sub){l + im->skip, y, stg + off, pitch}; bad = 0; }
 +            else bad = nvn_deswizzle(&t->d, l + im->skip, y, t->mem, stg + off, pitch);
              if (bad) { RED(8, "deswizzle failed: format %#x target %d", t->d.format, t->d.target); free(regions); return; }
-@@ -737,3 +807,3 @@ static vk_tex *tex_get_inner(const tex_t *t) {
+@@ -726,3 +802,3 @@ static vk_tex *tex_get_inner(const tex_t *t) {
+                 if (n <= 8) LOGV("storage %p (%ux%u) shared across formats: image NVN format %#x, texture %#x%s (%llu so far)", (void *)t->mem, t->d.width, t->d.height, im->nvn_fmt, t->d.format, stor_compressed(t) ? ", compressible" : "", (unsigned long long)n); } }
+-        else if ((im = img_create(t))) { im->shared = 1; im->k = k; nvn_hm_put(&g_by_storage, &k, im); if (k.fcls) {
++        else if ((t_half_req = !x->cpu_pool, im = img_create(t), t_half_req = 0, im)) { im->shared = 1; im->k = k;   /* S23: GPU-only (streamed) ones may be half too */ nvn_hm_put(&g_by_storage, &k, im); if (k.fcls) {
+             stor_key k0 = k; k0.fcls = 0; uintptr_t prev = (uintptr_t)nvn_hm_get(&g_comp_owner, &k0);
+@@ -737,3 +813,3 @@ static vk_tex *tex_get_inner(const tex_t *t) {
      } else {
 -        x->im = img_create(t);
 +        t_half_req = x->mirrored; x->im = img_create(t); t_half_req = 0;
          texcopy_resource(x->mirrored ? "realize-own-upload" : "realize-gpu-only-undefined", x);
-@@ -1670,2 +1740,3 @@ static void tex_mark_gpu_written_inner(vk_tex *x) {
+@@ -1087,2 +1163,3 @@ static void wb_note_locked(vk_tex *x) {
+     }
++    if (x->im->skip) { wb_tile_event(tile_version, "half-texture", 0, 0); return; }   /* TOTK_HALF_TEXTURES: no first level to write back */
+     int bw, bh; if (!nvn_fmt_bpb(t->d.format, &bw, &bh) || t->d.target == 2 || t->d.samples > 1 || (x->im->aspect & ~VK_IMAGE_ASPECT_COLOR_BIT)) {
+@@ -1670,2 +1747,3 @@ static void tex_mark_gpu_written_inner(vk_tex *x) {
      if (!x || !x->im) return;
-+    if (x->im->skip) { static int n; if (++n <= 8) RED(8, "half texture written by the GPU without a whole image first (ser %llu)", (unsigned long long)x->serial); vk_tex_make_whole(x); }
++    if (x->im->skip && x->mirrored) { static int n; if (++n <= 8) RED(8, "half texture written by the GPU without a whole image first (ser %llu)", (unsigned long long)x->serial); vk_tex_make_whole(x); }
      gpu_write_range_note(x);
-@@ -1712,3 +1783,10 @@ static VkImageView view_get(vk_tex *x, const view_t *v, int attach, int want_tar
+@@ -1712,3 +1790,10 @@ static VkImageView view_get(vk_tex *x, const view_t *v, int attach, int want_tar
      } else vk_fmt(fmt, NULL, &fs);
 -    unsigned l0 = v && v->set_levels ? v->base_level : 0, nl = v && v->set_levels && v->nlevels ? v->nlevels : im->levels - MINV(l0, im->levels);
 +    if (im->skip && attach) { if (!img_unhalve_locked(x)) return VK_NULL_HANDLE; im = x->im; }   /* rendered into or stored to: whole again */
