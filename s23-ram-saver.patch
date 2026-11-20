@@ -94,10 +94,23 @@ index 6b559bc..2956039 100644
 +void vk_desc_pool_sizes_init(void);
  int vk_desc_layout_fits(const VkDescriptorSetLayoutBinding *bindings, uint32_t count, char *why, size_t size);
 diff --git a/games/totk/android/gfx/vk_res.c b/games/totk/android/gfx/vk_res.c
-index 4b76828..69e5c9a 100644
+index 4b76828..bc59528 100644
 --- a/games/totk/android/gfx/vk_res.c
 +++ b/games/totk/android/gfx/vk_res.c
-@@ -94,2 +94,10 @@ static pthread_mutex_t g_mem_mu = PTHREAD_MUTEX_INITIALIZER;
+@@ -88,3 +88,11 @@ static void wb_diag_sweep(uint64_t start, uint64_t bytes, uint64_t chunks, int y
+ /* ---------- device memory: 64 MiB blocks per memory type, first-fit free lists; big images get their own ---------- */
+-#define BLOCK_SIZE (64ull << 20)
++/* S23 fork: TOTK_VK_BLOCK_MB=16 or 32 (default 64) - smaller texture blocks leave less free space stranded in blocks that
++   still hold one live texture, so more of them empty out and TOTK_VK_RELEASE_BLOCKS can hand them back. Images over a
++   quarter of a block get their own allocation, as before. Startup-only. */
++static VkDeviceSize block_size(void) {
++    static VkDeviceSize size;
++    if (!size) { const char *e = getenv("TOTK_VK_BLOCK_MB"); int mb = e ? atoi(e) : 64; if (mb != 16 && mb != 32) mb = 64; size = (VkDeviceSize)mb << 20; }
++    return size;
++}
++#define BLOCK_SIZE (block_size())
+ typedef struct { VkDeviceSize off, size; } span_t;
+@@ -94,2 +102,10 @@ static pthread_mutex_t g_mem_mu = PTHREAD_MUTEX_INITIALIZER;
  static uint64_t g_mem_dedicated_bytes, g_mem_block_bytes;
 +/* S23 fork: TOTK_VK_RELEASE_BLOCKS=1 hands a block that has become completely empty back to the driver, keeping one
 +   empty block per memory type as a spare (otherwise empty blocks stay allocated for reuse). A block is freed at the
@@ -108,7 +121,7 @@ index 4b76828..69e5c9a 100644
 +    return on;
 +}
  
-@@ -138,5 +146,10 @@ int vk_mem_alloc(const VkMemoryRequirements *req, VkMemoryPropertyFlags want, vk
+@@ -138,5 +154,10 @@ int vk_mem_alloc(const VkMemoryRequirements *req, VkMemoryPropertyFlags want, vk
          if (vk_memory_allocate(&mai, &m, VK_MEMORY_IMAGE_BLOCK)) break;
 -        int bi = g_nblocks++;
 -        g_blocks = realloc(g_blocks, (size_t)g_nblocks * sizeof *g_blocks);
@@ -122,7 +135,7 @@ index 4b76828..69e5c9a 100644
 +        }
 +        block_t *b = &g_blocks[bi]; b->mem = m; b->type = (uint32_t)type; b->nfree = 0; b->used = 0;
          block_free_insert(b, 0, BLOCK_SIZE);
-@@ -153,3 +166,11 @@ void vk_mem_free(vk_alloc *a) {
+@@ -153,3 +174,11 @@ void vk_mem_free(vk_alloc *a) {
          block_t *b = &g_blocks[a->block]; block_free_insert(b, a->off, a->size); b->used -= a->size;
 +        VkDeviceMemory empty = VK_NULL_HANDLE;
 +        if (!b->used && release_empty_blocks()) {
@@ -134,11 +147,11 @@ index 4b76828..69e5c9a 100644
          pthread_mutex_unlock(&g_mem_mu);
 +        if (empty) vk_memory_release(empty, VK_MEMORY_IMAGE_BLOCK);
      }
-@@ -214,2 +235,3 @@ typedef struct vk_img {
+@@ -214,2 +243,3 @@ typedef struct vk_img {
      int arr3d;      /* 3D, created 2D_ARRAY_COMPATIBLE: its slices can be render targets */
 +    uint32_t skip;  /* TOTK_HALF_TEXTURES: the image starts at the guest's level `skip` (image level = guest level - skip) */
      int blk_rt;     /* block-compressed, created BLOCK_TEXEL_VIEW_COMPATIBLE | EXTENDED_USAGE with attachment usage */
-@@ -455,2 +477,15 @@ static VkFormat srgb_twin(VkFormat f) {
+@@ -455,2 +485,15 @@ static VkFormat srgb_twin(VkFormat f) {
  }
 +/* TOTK_HALF_TEXTURES=1 (S23 fork, RAM saver): textures the game uploads from its memory and only samples (block-compressed,
 +   2D or 2D array, mipmapped, 128 or more on a side) are made without their first level: a quarter of the GPU memory. As
@@ -154,7 +167,7 @@ index 4b76828..69e5c9a 100644
 +    return on;
 +}
  static vk_img *img_create_ex(const tex_t *t, int all_formats) {
-@@ -467,2 +502,10 @@ static vk_img *img_create_ex(const tex_t *t, int all_formats) {
+@@ -467,2 +510,10 @@ static vk_img *img_create_ex(const tex_t *t, int all_formats) {
      im->levels = t->d.levels ? t->d.levels : 1; if (im->levels > allowed) im->levels = allowed; if (im->samples > 1) im->levels = 1;
 +    if (t_half_req && half_textures_on()) {   /* S23 fork: a sampled-only, block-compressed, mipmapped texture from its second level */
 +        int hbw, hbh; nvn_fmt_bpb(t->d.format, &hbw, &hbh);
@@ -165,12 +178,12 @@ index 4b76828..69e5c9a 100644
 +        }
 +    }
      im->fmt = f; im->nvn_fmt = t->d.format; im->aspect = vk_fmt_aspect(t->d.format);
-@@ -521,3 +564,3 @@ static uint64_t g_stat_image_replacements;
+@@ -521,3 +572,3 @@ static uint64_t g_stat_image_replacements;
  static int img_upgrade_inner(vk_tex *x, VkFormat want) {
 -    vk_img *old = x->im, *nu = img_create_ex(&x->t, 1);
 +    vk_img *old = x->im; t_half_req = old->skip != 0; vk_img *nu = img_create_ex(&x->t, 1); t_half_req = 0;
      if (!nu) return 0;
-@@ -556,2 +599,35 @@ static int img_upgrade_inner(vk_tex *x, VkFormat want) {
+@@ -556,2 +607,35 @@ static int img_upgrade_inner(vk_tex *x, VkFormat want) {
  static int img_upgrade(vk_tex *x, VkFormat want) { return VK_REC_VALUE(VK_REC_S_RESOURCE, img_upgrade_inner(x, want)); }
 +static void upload(vk_tex *x);
 +/* TOTK_HALF_TEXTURES: a half image the GPU is about to write, copy or render: made again at full size from the guest's
@@ -206,32 +219,32 @@ index 4b76828..69e5c9a 100644
 +    pthread_mutex_lock(&g_tex_mu); img_unhalve_locked(x); pthread_mutex_unlock(&g_tex_mu);
 +}
  
-@@ -644,4 +720,4 @@ static void upload_inner(vk_tex *x) {
+@@ -644,4 +728,4 @@ static void upload_inner(vk_tex *x) {
              if (linear) { size_t stride = nvn_tex_linear_stride(&t->d); bad = 0; for (size_t r = 0; r < rows * z; r++) memcpy(stg + off + r * pitch, t->mem + r * stride, pitch); }
 -            else if (pooled) { subs[ns++] = (upload_sub){l, y, stg + off, pitch}; bad = 0; }
 -            else bad = nvn_deswizzle(&t->d, l, y, t->mem, stg + off, pitch);
 +            else if (pooled) { subs[ns++] = (upload_sub){l + im->skip, y, stg + off, pitch}; bad = 0; }
 +            else bad = nvn_deswizzle(&t->d, l + im->skip, y, t->mem, stg + off, pitch);
              if (bad) { RED(8, "deswizzle failed: format %#x target %d", t->d.format, t->d.target); free(regions); return; }
-@@ -726,3 +802,3 @@ static vk_tex *tex_get_inner(const tex_t *t) {
+@@ -726,3 +810,3 @@ static vk_tex *tex_get_inner(const tex_t *t) {
                  if (n <= 8) LOGV("storage %p (%ux%u) shared across formats: image NVN format %#x, texture %#x%s (%llu so far)", (void *)t->mem, t->d.width, t->d.height, im->nvn_fmt, t->d.format, stor_compressed(t) ? ", compressible" : "", (unsigned long long)n); } }
 -        else if ((im = img_create(t))) { im->shared = 1; im->k = k; nvn_hm_put(&g_by_storage, &k, im); if (k.fcls) {
 +        else if ((t_half_req = !x->cpu_pool, im = img_create(t), t_half_req = 0, im)) { im->shared = 1; im->k = k;   /* S23: GPU-only (streamed) ones may be half too */ nvn_hm_put(&g_by_storage, &k, im); if (k.fcls) {
              stor_key k0 = k; k0.fcls = 0; uintptr_t prev = (uintptr_t)nvn_hm_get(&g_comp_owner, &k0);
-@@ -737,3 +813,3 @@ static vk_tex *tex_get_inner(const tex_t *t) {
+@@ -737,3 +821,3 @@ static vk_tex *tex_get_inner(const tex_t *t) {
      } else {
 -        x->im = img_create(t);
 +        t_half_req = x->mirrored; x->im = img_create(t); t_half_req = 0;
          texcopy_resource(x->mirrored ? "realize-own-upload" : "realize-gpu-only-undefined", x);
-@@ -1087,2 +1163,3 @@ static void wb_note_locked(vk_tex *x) {
+@@ -1087,2 +1171,3 @@ static void wb_note_locked(vk_tex *x) {
      }
 +    if (x->im->skip) { wb_tile_event(tile_version, "half-texture", 0, 0); return; }   /* TOTK_HALF_TEXTURES: no first level to write back */
      int bw, bh; if (!nvn_fmt_bpb(t->d.format, &bw, &bh) || t->d.target == 2 || t->d.samples > 1 || (x->im->aspect & ~VK_IMAGE_ASPECT_COLOR_BIT)) {
-@@ -1670,2 +1747,3 @@ static void tex_mark_gpu_written_inner(vk_tex *x) {
+@@ -1670,2 +1755,3 @@ static void tex_mark_gpu_written_inner(vk_tex *x) {
      if (!x || !x->im) return;
 +    if (x->im->skip && x->mirrored) { static int n; if (++n <= 8) RED(8, "half texture written by the GPU without a whole image first (ser %llu)", (unsigned long long)x->serial); vk_tex_make_whole(x); }
      gpu_write_range_note(x);
-@@ -1712,3 +1790,10 @@ static VkImageView view_get(vk_tex *x, const view_t *v, int attach, int want_tar
+@@ -1712,3 +1798,10 @@ static VkImageView view_get(vk_tex *x, const view_t *v, int attach, int want_tar
      } else vk_fmt(fmt, NULL, &fs);
 -    unsigned l0 = v && v->set_levels ? v->base_level : 0, nl = v && v->set_levels && v->nlevels ? v->nlevels : im->levels - MINV(l0, im->levels);
 +    if (im->skip && attach) { if (!img_unhalve_locked(x)) return VK_NULL_HANDLE; im = x->im; }   /* rendered into or stored to: whole again */
@@ -574,7 +587,7 @@ index 0000000..add2591
 +    }
 +}
 diff --git a/games/totk/android/java/com/aure/totk/setup/Settings.java b/games/totk/android/java/com/aure/totk/setup/Settings.java
-index 98f533d..ee48512 100644
+index 98f533d..6933e13 100644
 --- a/games/totk/android/java/com/aure/totk/setup/Settings.java
 +++ b/games/totk/android/java/com/aure/totk/setup/Settings.java
 @@ -37,3 +37,3 @@ final class Settings {
@@ -614,7 +627,7 @@ index 98f533d..ee48512 100644
 +        if (!get("draw_distance").equals("game")) line(out, "TOTK_FAR_CLAMP=" + get("draw_distance"));
 +        if (get("textures").equals("half")) line(out, "TOTK_HALF_TEXTURES=1");
          line(out, "TOTK_OPERATION_MODE=" + get("console_mode"));
-@@ -267,2 +281,22 @@ final class Settings {
+@@ -267,2 +281,24 @@ final class Settings {
          line(out, "TOTK_COMPANION=" + (get("second_screen").equals("on") ? "1" : "0"));
 +        // RAM saver: caps only the app's own caches (texture-upload staging, preloaded shaders); the game's memory pool
 +        // is never reduced. TOTK_RAM_SAVER is read by RamGuard in the game process (live trims under memory pressure).
@@ -633,6 +646,8 @@ index 98f533d..ee48512 100644
 +                line(out, "TOTK_VK_DESC_POOL_DIV=4");
 +                // Texture memory: hand empty 64 MiB blocks back to the system (one spare kept), e.g. after a teleport.
 +                line(out, "TOTK_VK_RELEASE_BLOCKS=1");
++                // ... in 16 MiB blocks instead of 64, so less free space stays stranded in half-used ones.
++                line(out, "TOTK_VK_BLOCK_MB=16");
 +                break;
 +            default: break;
 +        }
@@ -752,7 +767,7 @@ index 6ce0578..3ad4e02 100644
 +            case "textures": return value.equals("half") ? "Half" : "Full";
              case "aa": return value.equals("fxaa") ? "Game (FXAA)" : value.equals("smaa") ? "SMAA" : "Off";
 diff --git a/games/totk/runtime/frontend_android.c b/games/totk/runtime/frontend_android.c
-index ce1efe5..0189722 100644
+index ce1efe5..a5609d8 100644
 --- a/games/totk/runtime/frontend_android.c
 +++ b/games/totk/runtime/frontend_android.c
 @@ -1147,2 +1147,8 @@ static void log_start(void) {
@@ -769,10 +784,10 @@ index ce1efe5..0189722 100644
 +    /* RAM saver (S23 fork): host-side caches only; the game's own 3.2 GiB pool is never reduced. */
 +    "TOTK_RAM_SAVER", "TOTK_VK_STAGING_RETAIN_MB", "TOTK_SEED_WARM_MB", "TOTK_ROMFS_MMAP", "TOTK_PSO_PREWARM",
 +    "TOTK_VK_REC_MEMORY_MB", "TOTK_VK_DESC_POOL_DIV", "TOTK_FAR_CLAMP",
-+    "TOTK_VK_RELEASE_BLOCKS", "TOTK_HALF_TEXTURES",
++    "TOTK_VK_RELEASE_BLOCKS", "TOTK_HALF_TEXTURES", "TOTK_VK_BLOCK_MB",
  };
 diff --git a/tests/test_android_settings.py b/tests/test_android_settings.py
-index 006c426..147fafb 100644
+index 006c426..6c04755 100644
 --- a/tests/test_android_settings.py
 +++ b/tests/test_android_settings.py
 @@ -23,4 +23,14 @@ ALLOWED = {'TOTK_FPS60', 'TOTK_GPU_TIME', 'TOTK_FRAMEGEN', 'TOTK_REALTIME', 'TOT
@@ -781,7 +796,7 @@ index 006c426..147fafb 100644
 +           'TOTK_UNCAPPED', 'TOTK_UNCAPPED_HZ', 'TOTK_UNCAPPED_INTERVAL', 'TOTK_FRAME_RATE_HINT', 'TOTK_FRAME_RATE_HINT_HZ',
 +           'TOTK_RAM_SAVER', 'TOTK_VK_STAGING_RETAIN_MB', 'TOTK_SEED_WARM_MB', 'TOTK_ROMFS_MMAP', 'TOTK_PSO_PREWARM',
 +           'TOTK_VK_REC_MEMORY_MB', 'TOTK_VK_DESC_POOL_DIV', 'TOTK_FAR_CLAMP',
-+           'TOTK_VK_RELEASE_BLOCKS', 'TOTK_HALF_TEXTURES'}
++           'TOTK_VK_RELEASE_BLOCKS', 'TOTK_HALF_TEXTURES', 'TOTK_VK_BLOCK_MB'}
  FRONTEND = TOTK / 'runtime/frontend_android.c'
 +
 +
@@ -804,7 +819,7 @@ index 006c426..147fafb 100644
 +        on = self.env(ram_saver='on')
 +        self.assertIn('TOTK_RAM_SAVER=on', on); self.assertIn('TOTK_VK_STAGING_RETAIN_MB=96', on); self.assertIn('TOTK_SEED_WARM_MB=48', on)
 +        mx = self.env(ram_saver='max')
-+        for line in ('TOTK_RAM_SAVER=max', 'TOTK_VK_STAGING_RETAIN_MB=32', 'TOTK_SEED_WARM_MB=16', 'TOTK_ROMFS_MMAP=0', 'TOTK_PSO_PREWARM=0', 'TOTK_VK_REC_MEMORY_MB=16', 'TOTK_VK_DESC_POOL_DIV=4', 'TOTK_VK_RELEASE_BLOCKS=1'):
++        for line in ('TOTK_RAM_SAVER=max', 'TOTK_VK_STAGING_RETAIN_MB=32', 'TOTK_SEED_WARM_MB=16', 'TOTK_ROMFS_MMAP=0', 'TOTK_PSO_PREWARM=0', 'TOTK_VK_REC_MEMORY_MB=16', 'TOTK_VK_DESC_POOL_DIV=4', 'TOTK_VK_RELEASE_BLOCKS=1', 'TOTK_VK_BLOCK_MB=16'):
 +            self.assertIn(line, mx)
 +        self.assertIn('TOTK_RAM_SAVER=on', self.env(soc='SM8550'))
 +        self.assertNotIn('TOTK_RAM_SAVER=on', self.env(soc='SM8550', ram_saver='off'))
