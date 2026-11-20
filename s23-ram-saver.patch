@@ -949,10 +949,10 @@ index b330096..95877c9 100644
          RectF scene = new RectF(x0, y0 + sh * (1 - k), x0 + sw * k, y0 + sh);
 diff --git a/games/totk/android/java/com/aure/totk/setup/GameReport.java b/games/totk/android/java/com/aure/totk/setup/GameReport.java
 new file mode 100644
-index 0000000..fcf7598
+index 0000000..a84981a
 --- /dev/null
 +++ b/games/totk/android/java/com/aure/totk/setup/GameReport.java
-@@ -0,0 +1,136 @@
+@@ -0,0 +1,143 @@
 +package com.aure.totk.setup;
 +
 +import android.app.ActivityManager;
@@ -1004,12 +1004,19 @@ index 0000000..fcf7598
 +           after a crash and a quick restart, the report still shows the session that ended. */
 +        File log = game == null ? null : new File(game, "totk.log");
 +        File prev = game == null ? null : new File(game, "totk.prev.log");
-+        String which = "the last game session";
-+        if (log != null && prev.isFile() && (!log.isFile() || log.length() < 256 * 1024)) { log = prev; which = "the session before the last, short one"; }
-+        if (log != null) out.append("\n== Memory lines from ").append(which).append(" (start and end) ==\n").append(memoryLines(log));
-+        out.append("\n== ").append(log == null ? "totk.log" : log.getName()).append(" (last ").append(LOG_TAIL_BYTES / 1024)
-+                .append(" KiB of ").append(which).append(") ==\n");
-+        out.append(log == null ? "(game folder unknown)\n" : tail(log, LOG_TAIL_BYTES));
++        if (log == null) return out.append("\n(game folder unknown)\n").toString();
++        boolean shortLast = prev.isFile() && (!log.isFile() || log.length() < 256 * 1024);
++        if (shortLast) {   /* the last session ended early (a crash at start?): its own end first, then the one before */
++            out.append("\n== totk.log (last ").append(LOG_TAIL_BYTES / 2048).append(" KiB of the last, short game session) ==\n");
++            out.append(tail(log, LOG_TAIL_BYTES / 2));
++            out.append("\n== Memory lines from the session before it (start and end) ==\n").append(memoryLines(prev));
++            out.append("\n== totk.prev.log (last ").append(LOG_TAIL_BYTES / 2048).append(" KiB of the session before it) ==\n");
++            out.append(tail(prev, LOG_TAIL_BYTES / 2));
++        } else {
++            out.append("\n== Memory lines from the last game session (start and end) ==\n").append(memoryLines(log));
++            out.append("\n== totk.log (last ").append(LOG_TAIL_BYTES / 1024).append(" KiB of the last game session) ==\n");
++            out.append(tail(log, LOG_TAIL_BYTES));
++        }
 +        return out.toString();
 +    }
 +
@@ -1090,7 +1097,7 @@ index 0000000..fcf7598
 +    }
 +}
 diff --git a/games/totk/android/java/com/aure/totk/setup/Settings.java b/games/totk/android/java/com/aure/totk/setup/Settings.java
-index 98f533d..ca3307f 100644
+index 98f533d..e4c02d2 100644
 --- a/games/totk/android/java/com/aure/totk/setup/Settings.java
 +++ b/games/totk/android/java/com/aure/totk/setup/Settings.java
 @@ -37,3 +37,3 @@ final class Settings {
@@ -1135,7 +1142,7 @@ index 98f533d..ca3307f 100644
 +        // S23 fork, experimental: game memory pools get GPU (unswappable) memory only when the GPU first uses them.
 +        if (get("gpu_pools").equals("demand")) line(out, "TOTK_VK_LAZY_POOLS=1");
          line(out, "TOTK_OPERATION_MODE=" + get("console_mode"));
-@@ -267,2 +286,26 @@ final class Settings {
+@@ -267,2 +286,24 @@ final class Settings {
          line(out, "TOTK_COMPANION=" + (get("second_screen").equals("on") ? "1" : "0"));
 +        // RAM saver: caps only the app's own caches (texture-upload staging, preloaded shaders); the game's memory pool
 +        // is never reduced. TOTK_RAM_SAVER is read by RamGuard in the game process (live trims under memory pressure).
@@ -1156,8 +1163,6 @@ index 98f533d..ca3307f 100644
 +                line(out, "TOTK_VK_RELEASE_BLOCKS=1");
 +                // ... in 16 MiB blocks instead of 64, so less free space stays stranded in half-used ones.
 +                line(out, "TOTK_VK_BLOCK_MB=16");
-+                // The game's pages that a pool's GPU memory is mapped over are handed back instead of staying allocated.
-+                line(out, "TOTK_POOL_PUNCH=1");
 +                break;
 +            default: break;
 +        }
@@ -1509,7 +1514,7 @@ index 9211ffc..3d8d11e 100644
 +void nvn_dirty_freeze_end(void *addr, size_t len);
  void nvn_dirty_slot_stats(int *live, int *used_slots, uint64_t *adds_total); // 当前存活槽、槽表高水位、登记总次数 | Currently live slots, slot table high-water mark, total number of registrations
 diff --git a/tests/test_android_settings.py b/tests/test_android_settings.py
-index 006c426..2638f75 100644
+index 006c426..51b3c93 100644
 --- a/tests/test_android_settings.py
 +++ b/tests/test_android_settings.py
 @@ -23,4 +23,15 @@ ALLOWED = {'TOTK_FPS60', 'TOTK_GPU_TIME', 'TOTK_FRAMEGEN', 'TOTK_REALTIME', 'TOT
@@ -1534,7 +1539,7 @@ index 006c426..2638f75 100644
 -                    self.assertEqual(self.run_probe(f'envsocpreset {preset} {soc} en-GB')[0].replace('|', '\n'), before)
 +                    self.assertEqual(self.run_probe(f'envsocpreset {preset} {soc} en-GB')[0].replace('|', '\n'), with_ram_saver(before, soc))
                  for feed in ('off', 'on'):
-@@ -263,2 +274,27 @@ class SettingsTests(unittest.TestCase):
+@@ -263,2 +274,28 @@ class SettingsTests(unittest.TestCase):
  
 +    def test_ram_saver_levels(self):
 +        self.assertFalse(any('RAM' in l or 'SEED' in l for l in self.env(soc='QCS8550')))
@@ -1542,8 +1547,9 @@ index 006c426..2638f75 100644
 +        on = self.env(ram_saver='on')
 +        self.assertIn('TOTK_RAM_SAVER=on', on); self.assertIn('TOTK_VK_STAGING_RETAIN_MB=96', on); self.assertIn('TOTK_SEED_WARM_MB=48', on)
 +        mx = self.env(ram_saver='max')
-+        for line in ('TOTK_RAM_SAVER=max', 'TOTK_VK_STAGING_RETAIN_MB=32', 'TOTK_SEED_WARM_MB=16', 'TOTK_ROMFS_MMAP=0', 'TOTK_PSO_PREWARM=0', 'TOTK_VK_REC_MEMORY_MB=16', 'TOTK_VK_DESC_POOL_DIV=4', 'TOTK_VK_RELEASE_BLOCKS=1', 'TOTK_VK_BLOCK_MB=16', 'TOTK_POOL_PUNCH=1'):
++        for line in ('TOTK_RAM_SAVER=max', 'TOTK_VK_STAGING_RETAIN_MB=32', 'TOTK_SEED_WARM_MB=16', 'TOTK_ROMFS_MMAP=0', 'TOTK_PSO_PREWARM=0', 'TOTK_VK_REC_MEMORY_MB=16', 'TOTK_VK_DESC_POOL_DIV=4', 'TOTK_VK_RELEASE_BLOCKS=1', 'TOTK_VK_BLOCK_MB=16'):
 +            self.assertIn(line, mx)
++        self.assertNotIn('TOTK_POOL_PUNCH=1', mx)   # s23.15: crashed at start on the S23
 +        self.assertIn('TOTK_RAM_SAVER=on', self.env(soc='SM8550'))
 +        self.assertNotIn('TOTK_RAM_SAVER=on', self.env(soc='SM8550', ram_saver='off'))
 +
@@ -1562,7 +1568,7 @@ index 006c426..2638f75 100644
 +            self.assertIn('TOTK_FAR_CLAMP=' + metres, self.env(draw_distance=metres))
 +
      def test_frame_lag_only_adds_one_line_to_odin_native_sixty_bytes(self):
-@@ -291,3 +327,3 @@ class SettingsTests(unittest.TestCase):
+@@ -291,3 +328,3 @@ class SettingsTests(unittest.TestCase):
                              actual = self.run_probe(f'envsoc {soc} en-GB frame_rate={rate} frame_gen={framegen} gpu_feed={feed}')[0].replace('|', '\n')
 -                            self.assertEqual(actual.encode(), expected.encode())
 +                            self.assertEqual(actual.encode(), with_ram_saver(expected, soc).encode())
