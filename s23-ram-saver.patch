@@ -533,15 +533,63 @@ index eefcc8f..3473211 100644
 +void vk_res_half_stats(uint64_t out[2]);   /* TOTK_HALF_TEXTURES: textures made half, made whole again */
  uint32_t vk_tex_height(vk_tex *x, unsigned level);
 diff --git a/games/totk/android/gfx/vk_record.c b/games/totk/android/gfx/vk_record.c
-index 2d1e913..bad9b92 100644
+index 2d1e913..002b689 100644
 --- a/games/totk/android/gfx/vk_record.c
 +++ b/games/totk/android/gfx/vk_record.c
-@@ -544,3 +544,3 @@ void vk_record_test_results(uint64_t *checks, uint64_t *failures, uint64_t *rese
+@@ -31,2 +31,3 @@ typedef struct rec_storage_block {
+     struct rec_storage_block *next; struct rec_storage_slab *slab; size_t bytes;
++    uint32_t advised;   /* S23 TOTK_VK_REC_SLAB_FREE: free, its pages past the header already given back */
+     _Alignas(16) unsigned char data[];
+@@ -89,2 +90,3 @@ typedef struct rec_context {
+     int stock_on;         /* this owner's stock policy, switched only at its generation handoff (descriptors_recycle) */
++    uint32_t trim_used_hi, trim_gens;   /* S23 TOTK_VK_DESC_TRIM: most pools one generation used in this window */
+     struct {
+@@ -172,2 +174,3 @@ static uint64_t storage_limit = UINT64_C(64) << 20;
+ static _Atomic uint64_t storage_reclaims, storage_reclaimed, cb_reclaimed;
++static _Atomic uint64_t storage_advised, dpools_trimmed;   /* S23: TOTK_VK_REC_SLAB_FREE bytes, TOTK_VK_DESC_TRIM pools */
+ static uint64_t storage_trim_ns, storage_referenced;
+@@ -372,3 +375,3 @@ static void *storage_get(rec_storage *storage, size_t bytes, int info, const cha
+     rec_storage_block *block = storage->free[index];
+-    if (block) storage->free[index] = block->next;
++    if (block) { storage->free[index] = block->next; block->advised = 0; }
+     else {
+@@ -396,3 +399,3 @@ static void *storage_get(rec_storage *storage, size_t bytes, int info, const cha
+         STORAGE_UNPOISON(block, sizeof *block);
+-        block->bytes = capacity; block->slab = slab;
++        block->bytes = capacity; block->slab = slab; block->advised = 0;
+     }
+@@ -441,2 +444,25 @@ static uint64_t storage_trim(rec_storage *storage, int info) {
+ }
++/* S23 fork, TOTK_VK_REC_SLAB_FREE=1: a slab still holding one live array stays mapped, and so do the free blocks
++   around it (after a heavy scene, ~70 MiB of them). Their pages past each block's header go back to the system
++   (MADV_DONTNEED: zero-filled again when the block is reused); the mapping and the free lists stay as they are. */
++static int slab_free_on(void) {
++    static int on = -1;
++    if (on < 0) { const char *e = getenv("TOTK_VK_REC_SLAB_FREE"); on = e && !strcmp(e, "1"); }
++    return on;
++}
++static void storage_release_free(rec_storage *storage) {
++    uintptr_t pg = (uintptr_t)sysconf(_SC_PAGESIZE);
++    uint64_t given = 0;
++    for (unsigned i = 0; i < REC_STORAGE_CLASSES; i++)
++        for (rec_storage_block *b = storage->free[i]; b; b = b->next) {
++            if (b->advised) continue;
++            b->advised = 1;
++            uintptr_t lo = ((uintptr_t)(b + 1) + pg - 1) & ~(pg - 1), hi = ((uintptr_t)b + b->bytes) & ~(pg - 1);
++            if (hi <= lo) continue;
++            STORAGE_UNPOISON((void *)lo, hi - lo);
++            if (!madvise((void *)lo, hi - lo, MADV_DONTNEED)) given += hi - lo;
++            STORAGE_POISON((void *)lo, hi - lo);
++        }
++    if (given) atomic_fetch_add_explicit(&storage_advised, given, memory_order_relaxed);
++}
+ void vk_record_memory(uint64_t bytes[4]) {
+@@ -544,3 +570,3 @@ void vk_record_test_results(uint64_t *checks, uint64_t *failures, uint64_t *rese
     descriptor): they are not declared, since every declared descriptor is driver memory reserved in every pool. */
 -const VkDescriptorPoolSize vk_desc_pool_sizes[VK_DESC_POOL_TYPES] = {
 +VkDescriptorPoolSize vk_desc_pool_sizes[VK_DESC_POOL_TYPES] = {
      {VK_DESCRIPTOR_TYPE_SAMPLER, 8192}, {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 32768},
-@@ -549,2 +549,20 @@ const VkDescriptorPoolSize vk_desc_pool_sizes[VK_DESC_POOL_TYPES] = {
+@@ -549,2 +575,20 @@ const VkDescriptorPoolSize vk_desc_pool_sizes[VK_DESC_POOL_TYPES] = {
      {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 32768}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 8192}};
 +static uint64_t desc_pool_bytes(void);
 +void vk_desc_pool_sizes_init(void) {
@@ -562,6 +610,39 @@ index 2d1e913..bad9b92 100644
 +                         desc_pool_bytes() / 1048576.0);
 +}
  int vk_desc_layout_fits(const VkDescriptorSetLayoutBinding *bindings, uint32_t count, char *why, size_t size) {
+@@ -722,2 +766,10 @@ static void descriptors_trim(rec_context *c, uint32_t keep) {
+ }
++/* S23 fork, TOTK_VK_DESC_TRIM=1: a heavy scene leaves each recorder context with as many descriptor pools as its busiest
++   generation needed (Turnip backs each with ~1.9 MiB of GPU memory at TOTK_VK_DESC_POOL_DIV=4), kept for good. Every
++   240 generations, pools beyond the most any generation of that window used, plus one spare, are destroyed. */
++static int desc_trim_on(void) {
++    static int on = -1;
++    if (on < 0) { const char *e = getenv("TOTK_VK_DESC_TRIM"); on = e && !strcmp(e, "1"); }
++    return on;
++}
+ static void descriptors_recycle(rec_context *c) {
+@@ -731,2 +783,11 @@ static void descriptors_recycle(rec_context *c) {
+     uint32_t ceiling = want ? vk_desc_stock_ceiling() : 0, keep = c->ndp;
++    if (!c->stock_on && !want && desc_trim_on()) {   /* S23 TOTK_VK_DESC_TRIM */
++        uint32_t used = c->ndp ? c->curdp + (c->sets ? 1 : 0) : 0;
++        if (used > c->trim_used_hi) c->trim_used_hi = used;
++        if (++c->trim_gens >= 240) {
++            uint32_t k = c->trim_used_hi + 1;
++            if (k < keep) { atomic_fetch_add_explicit(&dpools_trimmed, keep - k, memory_order_relaxed); keep = k; }
++            c->trim_used_hi = used; c->trim_gens = 0;
++        }
++    }
+     if (c->stock_on) {
+@@ -1321,2 +1382,3 @@ void vk_record_slot_reset(unsigned slot) {
+         if (freed) atomic_fetch_add_explicit(&storage_reclaims, 1, memory_order_relaxed);
++        if (slab_free_on()) { storage_release_free(&slots[slot].draw_storage); storage_release_free(&slots[slot].info_storage); }
+         storage_trim_ns += host_now_ns() - trim_start;
+@@ -1704,2 +1766,5 @@ void vk_record_stats(uint64_t frame) {
+         (unsigned long long)atomic_load(&cb_reclaimed));
++    if (slab_free_on() || desc_trim_on())
++        LOGV("[rec-trim] free slab pages given back %.1f MiB (TOTK_VK_REC_SLAB_FREE), idle descriptor pools destroyed %llu (TOTK_VK_DESC_TRIM), since start",
++             atomic_load(&storage_advised) / 1048576.0, (unsigned long long)atomic_load(&dpools_trimmed));
+     uint64_t active = 0, peak = 0, returned = 0, cold = 0;
 diff --git a/games/totk/android/gfx/vk_record.h b/games/totk/android/gfx/vk_record.h
 index 6b559bc..2956039 100644
 --- a/games/totk/android/gfx/vk_record.h
@@ -1176,7 +1257,7 @@ index b330096..95877c9 100644
          RectF scene = new RectF(x0, y0 + sh * (1 - k), x0 + sw * k, y0 + sh);
 diff --git a/games/totk/android/java/com/aure/totk/setup/GameReport.java b/games/totk/android/java/com/aure/totk/setup/GameReport.java
 new file mode 100644
-index 0000000..f1fdd07
+index 0000000..3b671be
 --- /dev/null
 +++ b/games/totk/android/java/com/aure/totk/setup/GameReport.java
 @@ -0,0 +1,144 @@
@@ -1295,7 +1376,7 @@ index 0000000..f1fdd07
 +                        || line.contains("mark meminfo") || line.contains(" fps over the last 300")
 +                        || line.contains("memory pools-use") || line.contains("[pipe-keep]")
 +                        || line.contains("memory pools-lazy") || line.contains("on-demand pool")
-+                        || line.contains("[tex-compact]") || line.contains("malloc purge") || line.contains("[area-clean]")) {
++                        || line.contains("[tex-compact]") || line.contains("malloc purge") || line.contains("[area-clean]") || line.contains("[rec-trim]")) {
 +                    if (first.size() < 20) { first.add(line); continue; }
 +                    if (keep.size() == 100) { keep.removeFirst(); skipped++; }
 +                    keep.addLast(line);
@@ -1325,7 +1406,7 @@ index 0000000..f1fdd07
 +    }
 +}
 diff --git a/games/totk/android/java/com/aure/totk/setup/Settings.java b/games/totk/android/java/com/aure/totk/setup/Settings.java
-index 98f533d..a52caaf 100644
+index 98f533d..c49eff0 100644
 --- a/games/totk/android/java/com/aure/totk/setup/Settings.java
 +++ b/games/totk/android/java/com/aure/totk/setup/Settings.java
 @@ -37,3 +37,3 @@ final class Settings {
@@ -1370,7 +1451,7 @@ index 98f533d..a52caaf 100644
 +        // S23 fork, experimental: game memory pools get GPU (unswappable) memory only when the GPU first uses them.
 +        if (get("gpu_pools").equals("demand")) line(out, "TOTK_VK_LAZY_POOLS=1");
          line(out, "TOTK_OPERATION_MODE=" + get("console_mode"));
-@@ -267,2 +286,30 @@ final class Settings {
+@@ -267,2 +286,33 @@ final class Settings {
          line(out, "TOTK_COMPANION=" + (get("second_screen").equals("on") ? "1" : "0"));
 +        // RAM saver: caps only the app's own caches (texture-upload staging, preloaded shaders); the game's memory pool
 +        // is never reduced. TOTK_RAM_SAVER is read by RamGuard in the game process (live trims under memory pressure).
@@ -1395,8 +1476,11 @@ index 98f533d..a52caaf 100644
 +                line(out, "TOTK_MALLOC_PURGE=1");
 +                // Right after an area change (many game pools freed at once): that clean-up at once, not seconds later.
 +                line(out, "TOTK_AREA_CLEAN=1");
-+                // Textures over 2 MiB get their own allocation, returned whole when freed (no holes left in shared blocks).
-+                line(out, "TOTK_VK_DEDICATED_KB=2048");
++                // Textures over 512 KiB get their own allocation, returned whole when freed (no holes left in shared blocks).
++                line(out, "TOTK_VK_DEDICATED_KB=512");
++                // After a heavy scene: idle descriptor pools destroyed, free recorder memory handed back.
++                line(out, "TOTK_VK_DESC_TRIM=1");
++                line(out, "TOTK_VK_REC_SLAB_FREE=1");
 +                break;
 +            default: break;
 +        }
@@ -1529,7 +1613,7 @@ index 6ce0578..755d615 100644
 +            case "gpu_pools": return value.equals("demand") ? "On demand" : "At start";
              case "aa": return value.equals("fxaa") ? "Game (FXAA)" : value.equals("smaa") ? "SMAA" : "Off";
 diff --git a/games/totk/runtime/frontend_android.c b/games/totk/runtime/frontend_android.c
-index ce1efe5..b8619b9 100644
+index ce1efe5..f6cfc63 100644
 --- a/games/totk/runtime/frontend_android.c
 +++ b/games/totk/runtime/frontend_android.c
 @@ -1147,2 +1147,8 @@ static void log_start(void) {
@@ -1548,7 +1632,7 @@ index ce1efe5..b8619b9 100644
 +    "TOTK_VK_REC_MEMORY_MB", "TOTK_VK_DESC_POOL_DIV", "TOTK_FAR_CLAMP",
 +    "TOTK_VK_RELEASE_BLOCKS", "TOTK_HALF_TEXTURES", "TOTK_VK_BLOCK_MB", "TOTK_VK_PIPE_KEEP",
 +    "TOTK_VK_LAZY_POOLS", "TOTK_POOL_PUNCH", "TOTK_VK_TEX_COMPACT", "TOTK_MALLOC_PURGE",
-+    "TOTK_AREA_CLEAN", "TOTK_VK_DEDICATED_KB",
++    "TOTK_AREA_CLEAN", "TOTK_VK_DEDICATED_KB", "TOTK_VK_DESC_TRIM", "TOTK_VK_REC_SLAB_FREE",
  };
 diff --git a/games/totk/runtime/fs_host.c b/games/totk/runtime/fs_host.c
 index 4ea8f85..c1f3290 100644
@@ -1749,7 +1833,7 @@ index 9211ffc..3d8d11e 100644
 +void nvn_dirty_freeze_end(void *addr, size_t len);
  void nvn_dirty_slot_stats(int *live, int *used_slots, uint64_t *adds_total); // 当前存活槽、槽表高水位、登记总次数 | Currently live slots, slot table high-water mark, total number of registrations
 diff --git a/tests/test_android_settings.py b/tests/test_android_settings.py
-index 006c426..f7d2d25 100644
+index 006c426..e4de6ec 100644
 --- a/tests/test_android_settings.py
 +++ b/tests/test_android_settings.py
 @@ -23,4 +23,16 @@ ALLOWED = {'TOTK_FPS60', 'TOTK_GPU_TIME', 'TOTK_FRAMEGEN', 'TOTK_REALTIME', 'TOT
@@ -1760,7 +1844,7 @@ index 006c426..f7d2d25 100644
 +           'TOTK_VK_REC_MEMORY_MB', 'TOTK_VK_DESC_POOL_DIV', 'TOTK_FAR_CLAMP',
 +           'TOTK_VK_RELEASE_BLOCKS', 'TOTK_HALF_TEXTURES', 'TOTK_VK_BLOCK_MB', 'TOTK_VK_PIPE_KEEP',
 +           'TOTK_VK_LAZY_POOLS', 'TOTK_POOL_PUNCH', 'TOTK_VK_TEX_COMPACT', 'TOTK_MALLOC_PURGE',
-+           'TOTK_AREA_CLEAN', 'TOTK_VK_DEDICATED_KB'}
++           'TOTK_AREA_CLEAN', 'TOTK_VK_DEDICATED_KB', 'TOTK_VK_DESC_TRIM', 'TOTK_VK_REC_SLAB_FREE'}
  FRONTEND = TOTK / 'runtime/frontend_android.c'
 +
 +
@@ -1783,7 +1867,7 @@ index 006c426..f7d2d25 100644
 +        on = self.env(ram_saver='on')
 +        self.assertIn('TOTK_RAM_SAVER=on', on); self.assertIn('TOTK_VK_STAGING_RETAIN_MB=96', on); self.assertIn('TOTK_SEED_WARM_MB=48', on)
 +        mx = self.env(ram_saver='max')
-+        for line in ('TOTK_RAM_SAVER=max', 'TOTK_VK_STAGING_RETAIN_MB=32', 'TOTK_SEED_WARM_MB=16', 'TOTK_ROMFS_MMAP=0', 'TOTK_PSO_PREWARM=0', 'TOTK_VK_REC_MEMORY_MB=16', 'TOTK_VK_DESC_POOL_DIV=4', 'TOTK_VK_RELEASE_BLOCKS=1', 'TOTK_VK_BLOCK_MB=16', 'TOTK_MALLOC_PURGE=1', 'TOTK_AREA_CLEAN=1', 'TOTK_VK_DEDICATED_KB=2048'):
++        for line in ('TOTK_RAM_SAVER=max', 'TOTK_VK_STAGING_RETAIN_MB=32', 'TOTK_SEED_WARM_MB=16', 'TOTK_ROMFS_MMAP=0', 'TOTK_PSO_PREWARM=0', 'TOTK_VK_REC_MEMORY_MB=16', 'TOTK_VK_DESC_POOL_DIV=4', 'TOTK_VK_RELEASE_BLOCKS=1', 'TOTK_VK_BLOCK_MB=16', 'TOTK_MALLOC_PURGE=1', 'TOTK_AREA_CLEAN=1', 'TOTK_VK_DEDICATED_KB=512', 'TOTK_VK_DESC_TRIM=1', 'TOTK_VK_REC_SLAB_FREE=1'):
 +            self.assertIn(line, mx)
 +        self.assertNotIn('TOTK_POOL_PUNCH=1', mx)   # s23.15: crashed at start on the S23
 +        self.assertNotIn('TOTK_VK_TEX_COMPACT=1', mx)   # s23.17: draining blocks left more texture memory allocated, not less
