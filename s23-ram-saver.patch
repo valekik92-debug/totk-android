@@ -1,5 +1,5 @@
 diff --git a/games/totk/android/gfx/nvn_vk.c b/games/totk/android/gfx/nvn_vk.c
-index 956f3fb..7110995 100644
+index 956f3fb..de7fb97 100644
 --- a/games/totk/android/gfx/nvn_vk.c
 +++ b/games/totk/android/gfx/nvn_vk.c
 @@ -533,2 +533,5 @@ void vk_rec_profile_present(uint64_t frame) {
@@ -20,7 +20,89 @@ index 956f3fb..7110995 100644
      VKCHECK(vkCreateDevice(V.pd, &dci, NULL, &V.dev));
 +    vk_desc_pool_sizes_init();   /* S23 fork: TOTK_VK_DESC_POOL_DIV, before any layout or pool */
  #define DL(name) name = (PFN_##name)vkGetDeviceProcAddr(V.dev, #name);
-@@ -6527,4 +6533,25 @@ void vk_mem_report(void) {
+@@ -1056,3 +1062,21 @@ static uint64_t g_wb_alias_maps, g_wb_alias_bytes;   /* g_pool_mu; one mapping p
+    span. An early large pool kept the old prefix-max backscan linear; resolve_local was 10.6% of recording at Lookout Landing. */
+-typedef struct { uintptr_t lo, end; VkBuffer buf; uint64_t off; } span_t;   /* off: buffer offset of lo */
++typedef struct { uintptr_t lo, end; VkBuffer buf; uint64_t off; uintptr_t ob; } span_t;   /* off: buffer offset of lo; ob: guest base of the buffer's own pool (S23 diagnostics) */
++/* S23 fork diagnostics: which 64 KiB pieces of GPU-backed pool memory the GPU ever reads or writes as a buffer (every
++   resolve of an address to a pool buffer marks the owning pool's bytes). Pieces never marked hold only texture storage
++   (textures live in their own images) or nothing the GPU touches: memory that would not need to be GPU memory. */
++#define USE_BASE 0x300000000ull
++#define USE_SPAN (16ull << 30)
++static _Atomic uint64_t g_use_bits[(USE_SPAN >> 16) / 64];
++static inline void use_mark(const span_t *best, uintptr_t a, uintptr_t n) {
++    if (!best->ob) return;
++    uint64_t p = best->ob + best->off + (a - best->lo), e = p + (n ? n : 1);
++    if (p < USE_BASE || e > USE_BASE + USE_SPAN) return;
++    uint64_t c0 = (p - USE_BASE) >> 16, c1 = (e - 1 - USE_BASE) >> 16;
++    if (c1 - c0 > 1024) c1 = c0 + 1024;
++    for (uint64_t c = c0; c <= c1; c++) {
++        uint64_t bit = 1ull << (c & 63);
++        if (!(atomic_load_explicit(&g_use_bits[c >> 6], memory_order_relaxed) & bit))
++            atomic_fetch_or_explicit(&g_use_bits[c >> 6], bit, memory_order_relaxed);
++    }
++}
+ typedef struct { uintptr_t lo; int best; } span_seg_t;   /* best covers [lo, next lo); the last breakpoint has no span */
+@@ -1707,3 +1731,3 @@ static void span_rebuild(void) {   /* caller holds g_pool_mu */
+     g_nspan = 0;
+-    for (int i = 0; i < g_nalias; i++) { const alias_ent *x = &g_alias[i]; g_span[g_nspan++] = (span_t){x->va, x->end, x->owner->buf, x->off}; }
++    for (int i = 0; i < g_nalias; i++) { const alias_ent *x = &g_alias[i]; g_span[g_nspan++] = (span_t){x->va, x->end, x->owner->buf, x->off, x->owner->base}; }
+     for (int i = 0; i < g_npool; i++) {
+@@ -1711,4 +1735,4 @@ static void span_rebuild(void) {   /* caller holds g_pool_mu */
+         if (g_wb_alias_enabled && p->guest_unknown) continue;
+-        if (p->kind == K_OWN) g_span[g_nspan++] = (span_t){p->base, p->end, p->buf, 0};
+-        else if (p->kind == K_VIEW) g_span[g_nspan++] = (span_t){p->base, p->end, p->owner->buf, p->off};
++        if (p->kind == K_OWN) g_span[g_nspan++] = (span_t){p->base, p->end, p->buf, 0, p->base};
++        else if (p->kind == K_VIEW) g_span[g_nspan++] = (span_t){p->base, p->end, p->owner->buf, p->off, p->owner->base};
+     }
+@@ -1783,2 +1807,3 @@ static int resolve_span(uint64_t addr, uint64_t len, VkBuffer *buf, uint64_t *of
+     if (!best) return 0;
++    use_mark(best, a, b - a);
+     *buf = best->buf; *off = best->off + (a - best->lo); if (avail) *avail = best->end - a;
+@@ -1832,2 +1857,3 @@ static int resolve_local(uint64_t addr, uint64_t len, VkBuffer *buf, uint64_t *o
+     if (!best) return 0;
++    use_mark(best, a, b - a);
+     *buf = best->buf; *off = best->off + (a - best->lo); if (avail) *avail = best->end - a;
+@@ -1874,7 +1900,7 @@ const vk_record_spans *vk_record_spans_capture(unsigned slot) {
+         s->span = VK_MALLOC((size_t)(g_nalias + g_npool) * sizeof *s->span);
+-        for (int i = 0; i < g_nalias; i++) { const alias_ent *a = &g_alias[i]; s->span[s->count++] = (span_t){a->va, a->end, a->owner->buf, a->off}; }
++        for (int i = 0; i < g_nalias; i++) { const alias_ent *a = &g_alias[i]; s->span[s->count++] = (span_t){a->va, a->end, a->owner->buf, a->off, a->owner->base}; }
+         for (int i = 0; i < g_npool; i++) { const pool_ent *p = g_pools[i];
+             if (g_wb_alias_enabled && p->guest_unknown) continue;
+-            if (p->kind == K_OWN) s->span[s->count++] = (span_t){p->base, p->end, p->buf, 0};
+-            else if (p->kind == K_VIEW) s->span[s->count++] = (span_t){p->base, p->end, p->owner->buf, p->off};
++            if (p->kind == K_OWN) s->span[s->count++] = (span_t){p->base, p->end, p->buf, 0, p->base};
++            else if (p->kind == K_VIEW) s->span[s->count++] = (span_t){p->base, p->end, p->owner->buf, p->off, p->owner->base};
+         }
+@@ -1916,2 +1942,3 @@ static int record_resolve_inner(const vk_record_spans *s, uint64_t a, uint64_t n
+     if (!best) return 0;
++    use_mark(best, a, n);
+     *b = best->buf; *o = best->off + a - best->lo; if (available) *available = best->end - a; return 1;
+@@ -1951,2 +1978,23 @@ int mtl_addr(uint64_t addr, uint64_t len, void **buf, uint64_t *off) {
+ /* mtl_pool_invalidate: vk_res.c (GPU write-back of renderings into CPU-pool textures) */
++/* S23 diagnostics: GPU-backed pool bytes the GPU has used as a buffer so far, and pools it never touched. */
++static void pool_use_totals(uint64_t *used, uint64_t *unused, uint64_t *untouched_pools, uint64_t *untouched_bytes, uint64_t *outside) {
++    *used = *unused = *untouched_pools = *untouched_bytes = *outside = 0;
++    pthread_mutex_lock(&g_pool_mu);
++    for (int i = 0; i < g_npool; i++) {
++        const pool_ent *p = g_pools[i];
++        if (p->kind != K_OWN) continue;
++        if (p->base < USE_BASE || p->end > USE_BASE + USE_SPAN) { *outside += p->end - p->base; continue; }
++        uint64_t u = 0;
++        for (uint64_t c = (p->base - USE_BASE) >> 16; c <= (p->end - 1 - USE_BASE) >> 16; c++) {
++            if (!(atomic_load_explicit(&g_use_bits[c >> 6], memory_order_relaxed) & (1ull << (c & 63)))) continue;
++            uint64_t lo = USE_BASE + (c << 16), hi = lo + 65536;
++            if (lo < p->base) lo = p->base;
++            if (hi > p->end) hi = p->end;
++            u += hi - lo;
++        }
++        *used += u; *unused += (p->end - p->base) - u;
++        if (!u) { (*untouched_pools)++; *untouched_bytes += p->end - p->base; }
++    }
++    pthread_mutex_unlock(&g_pool_mu);
++}
+ void gpu_pool_totals(uint64_t *n, uint64_t *bytes) { pthread_mutex_lock(&g_pool_mu); *n = (uint64_t)g_npool; *bytes = g_pool_bytes; pthread_mutex_unlock(&g_pool_mu); }
+@@ -6527,4 +6575,29 @@ void vk_mem_report(void) {
      uint64_t r[8]; vk_res_mem(r);
 -    LOGV("memory image blocks: used/free %.3f/%.3f MiB (empty blocks retained for reuse)",
 -        r[7] / 1048576.0, (r[0] - r[7]) / 1048576.0);
@@ -46,32 +128,118 @@ index 956f3fb..7110995 100644
 +#endif
 +        LOGV("memory diag: GPU used/budget%s; pipeline cache %zu KiB; malloc arena %zu MiB, mmapped %zu MiB, free in arena %zu MiB",
 +             heaps, pc >> 10, (size_t)md.arena >> 20, (size_t)md.hblkhd >> 20, (size_t)md.fordblks >> 20);
++        uint64_t used, unused, upools, ubytes, outside; pool_use_totals(&used, &unused, &upools, &ubytes, &outside);
++        LOGV("memory pools-use: GPU-backed pool bytes used by the GPU as buffers %llu MiB, never %llu MiB (64 KiB pieces); pools never touched %llu (%llu MiB); outside the tracked range %llu MiB",
++             (unsigned long long)(used >> 20), (unsigned long long)(unused >> 20), (unsigned long long)upools,
++             (unsigned long long)(ubytes >> 20), (unsigned long long)(outside >> 20));
 +    }
  #ifdef __GLIBC__
 diff --git a/games/totk/android/gfx/vk_draw.c b/games/totk/android/gfx/vk_draw.c
-index 09993ed..b72f42b 100644
+index 09993ed..8588b1e 100644
 --- a/games/totk/android/gfx/vk_draw.c
 +++ b/games/totk/android/gfx/vk_draw.c
-@@ -6083,2 +6083,6 @@ static void copy_b2t(const p_copy_b2t *c) {   /* buffer -> texture (row stride f
+@@ -3565,2 +3565,3 @@ typedef struct pipe_ent {
+     vk_lend lend;                      /* g_pq_mu: the worker building it and any nice a waiter lent it */
++    uint64_t last_frame; int evicted;  /* S23 TOTK_VK_PIPE_KEEP: last drawn frame (walking thread); handle destroyed, rebuilt at next use */
+ } pipe_ent;
+@@ -3568,2 +3569,3 @@ typedef struct pipe_ent {
+ static nvn_hmap g_pipes = {.klen = sizeof(pipe_key)};
++static uint64_t g_pk_evicted, g_pk_rebuilt, g_pk_frame;   /* TOTK_VK_PIPE_KEEP; g_pk_frame: presents so far */
+ /* Separate immutable subset caches. The mutex protects map/publication only, never driver compilation.
+@@ -4038,2 +4040,3 @@ static vk_lend pipe_publish(pipe_ent *e, VkResult r, VkPipeline p, uint64_t dt)
+     e->optimized_ns = dt;
++    if (!r && e->evicted) { e->evicted = 0; g_pk_rebuilt++; }
+     e->p = p;
+@@ -4334,2 +4337,51 @@ void vk_pipeline_prewarm(void) {
+ }
++/* TOTK_VK_PIPE_KEEP=<n> (S23 fork, RAM saver; 0/unset = keep every pipeline, as before): every 300 presents, when more
++   than n graphics pipelines are ready, the ones not drawn for the longest time (and not for at least 900 frames, far past
++   any submission still on the GPU) give their driver objects back. The entry stays: its next draw rebuilds it at once
++   from the pipeline cache (a cache hit, milliseconds), as a failed pipeline's retry does. Walking thread, vk_rec_lock. */
++static int pipe_keep(void) {
++    static int keep = -1;
++    if (keep < 0) { const char *e = getenv("TOTK_VK_PIPE_KEEP"); keep = e ? atoi(e) : 0; if (keep < 0) keep = 0; if (keep && keep < 300) keep = 300;
++        if (keep) LOGV("TOTK_VK_PIPE_KEEP=%d: graphics pipelines beyond it, unused for 900+ frames, are released and rebuilt on demand", keep); }
++    return keep;
++}
++static int pipe_keep_cmp(const void *a, const void *b) {
++    uint64_t x = (*(pipe_ent *const *)a)->last_frame, y = (*(pipe_ent *const *)b)->last_frame;
++    return x < y ? -1 : x > y;
++}
++static void pipe_keep_sweep(uint64_t n) {
++    int keep = pipe_keep();
++    if (!keep) return;
++    uint64_t now = g_pk_frame;
++    unsigned ready = 0, ncand = 0;
++    pipe_ent **cand = malloc((size_t)(g_pipes.cap ? g_pipes.cap : 1) * sizeof *cand);
++    if (!cand) return;
++    for (uint32_t i = 0; i < g_pipes.cap; i++) {
++        pipe_ent *e = g_pipes.vals ? g_pipes.vals[i] : NULL;
++        if (!e || atomic_load_explicit(&e->state, memory_order_acquire) != PE_READY || !e->p || e->p == PIPE_FAILED) continue;
++        ready++;
++        if (now > e->last_frame + 900) cand[ncand++] = e;
++    }
++    unsigned evict = 0;
++    if (ready > (unsigned)keep && ncand) {
++        qsort(cand, ncand, sizeof *cand, pipe_keep_cmp);
++        unsigned want = ready - (unsigned)keep; if (want > ncand) want = ncand;
++        pthread_mutex_lock(&g_pq_mu);
++        for (unsigned i = 0; i < want; i++) {
++            pipe_ent *e = cand[i];
++            if (atomic_load_explicit(&e->state, memory_order_acquire) != PE_READY) continue;
++            vkDestroyPipeline(V.dev, e->p, NULL); e->p = VK_NULL_HANDLE;
++            if (e->fast) { vkDestroyPipeline(V.dev, e->fast, NULL); e->fast = VK_NULL_HANDLE; }
++            e->fast_attempted = 0; e->replaced = 0;
++            e->seen_failure = e->failures; e->retry_at = 0; e->evicted = 1;
++            atomic_store_explicit(&e->state, PE_FAILED, memory_order_release);   /* next draw: pipe_build_now, from the cache */
++            evict++;
++        }
++        pthread_mutex_unlock(&g_pq_mu);
++    }
++    free(cand);
++    g_pk_evicted += evict;
++    LOGV("[pipe-keep] frame %llu: %u ready graphics pipelines (keep %d), %u released now, %llu released and %llu rebuilt since start",
++         (unsigned long long)n, ready - evict, keep, evict, (unsigned long long)g_pk_evicted, (unsigned long long)g_pk_rebuilt);
++}
+ static VkPipeline pipe_get(vk_shader *vs, vk_shader *fs, int prim, VkPipelineLayout layout) {
+@@ -4354,2 +4406,3 @@ static VkPipeline pipe_get(vk_shader *vs, vk_shader *fs, int prim, VkPipelineLay
+         pso_demand(e, capture);
++        e->last_frame = g_pk_frame;
+         last = e; int s = atomic_load_explicit(&e->state, memory_order_acquire);
+@@ -4395,3 +4448,3 @@ static VkPipeline pipe_get(vk_shader *vs, vk_shader *fs, int prim, VkPipelineLay
+     }
+-    e = calloc(1, sizeof *e); e->k = k; e->layout = layout; e->frame = totk_ft_work_frame(); last = e;
++    e = calloc(1, sizeof *e); e->k = k; e->layout = layout; e->frame = totk_ft_work_frame(); e->last_frame = g_pk_frame; last = e;
+     e->capture = capture;
+@@ -6083,2 +6136,6 @@ static void copy_b2t(const p_copy_b2t *c) {   /* buffer -> texture (row stride f
      size_t row = S.copy_stride ? (size_t)S.copy_stride : (size_t)((c->r.width + bw - 1) / bw) * bpb, rows = (c->r.height + bh - 1) / bh, img = row * rows;
 +    if (vk_tex_skip(x)) {   /* TOTK_HALF_TEXTURES: the image starts at the guest's second level */
 +        if (level < vk_tex_skip(x)) { vk_tex_half_drop("buffer-to-texture copy"); return; }
 +        level -= vk_tex_skip(x);
 +    }
      int nz = c->r.depth ? c->r.depth : 1, is3d = vk_tex_is3d(x);
-@@ -6135,2 +6139,3 @@ static void copy_t2b(const p_copy_b2t *c) {   /* texture -> buffer */
+@@ -6135,2 +6192,3 @@ static void copy_t2b(const p_copy_b2t *c) {   /* texture -> buffer */
      }
 +    vk_tex_make_whole(x);
      int bw, bh, bpb = nvn_fmt_bpb(c->tex->d.format, &bw, &bh);
-@@ -6201,2 +6206,4 @@ static void copy_t2t(const p_copy_t2t *c) {   /* texture -> texture: same size a
+@@ -6201,2 +6259,4 @@ static void copy_t2t(const p_copy_t2t *c) {   /* texture -> texture: same size a
      unsigned sl = vlevel(&c->sv, c->has_sv), dl = vlevel(&c->dv, c->has_dv), sz0 = vlayer(&c->sv, c->has_sv), dz0 = vlayer(&c->dv, c->has_dv);
 +    if (vk_tex_skip(s)) { if (sl < vk_tex_skip(s)) vk_tex_make_whole(s); else sl -= vk_tex_skip(s); }   /* TOTK_HALF_TEXTURES */
 +    if (vk_tex_skip(d)) { if (dl < vk_tex_skip(d)) { vk_tex_half_drop("texture copy"); return; } dl -= vk_tex_skip(d); }
      int s3 = vk_tex_is3d(s), d3 = vk_tex_is3d(d), nz = c->sr.depth ? c->sr.depth : 1;
-@@ -6354,2 +6361,3 @@ static void clear_tex(const p_clear_tex *c) {   /* clear a texture region with a
+@@ -6354,2 +6414,3 @@ static void clear_tex(const p_clear_tex *c) {   /* clear a texture region with a
      vk_tex *x = vk_tex_get(c->tex); if (!x) return;
 +    vk_tex_make_whole(x);
      unsigned lv = vlevel(&c->view, c->has_view), l0 = vlayer(&c->view, c->has_view);
+@@ -10435,3 +10496,3 @@ uint64_t mtl_present(const tex_t *t, double period, const int crop[4]) {
+     }
+-    g_fr_n = 0;
++    g_fr_n = 0; g_pk_frame = n;
+     g_pres_t[n % 64] = now / 1e9;
+@@ -10500,2 +10561,3 @@ uint64_t mtl_present(const tex_t *t, double period, const int crop[4]) {
+         vk_rec_lock(); vk_occlusion_stats(n); gpu_work_stats(n); native_gpu_stats(n);
++        pipe_keep_sweep(n);
+         LOGV("[load-elide] frame %llu: last 300 presents %llu proven, %llu elided passes",
 diff --git a/games/totk/android/gfx/vk_int.h b/games/totk/android/gfx/vk_int.h
 index eefcc8f..3473211 100644
 --- a/games/totk/android/gfx/vk_int.h
@@ -546,13 +714,13 @@ index 968cf89..3cf93f0 100644
 +        if (ramGuard != null) { ramGuard.close(); ramGuard = null; }
          if (feedback != null) { feedback.close(); feedback = null; }
 diff --git a/games/totk/android/java/com/aure/totk/setup/Diagram.java b/games/totk/android/java/com/aure/totk/setup/Diagram.java
-index b330096..ee5e01d 100644
+index b330096..1f365b4 100644
 --- a/games/totk/android/java/com/aure/totk/setup/Diagram.java
 +++ b/games/totk/android/java/com/aure/totk/setup/Diagram.java
 @@ -34,3 +34,3 @@ final class Diagram extends View {
              case "game_language": return 170;
 -            case "gpu_feed": case "rumble": case "motion": return 0;   // text and facts only
-+            case "gpu_feed": case "rumble": case "motion": case "ram_saver": case "draw_distance": case "textures": return 0;   // text and facts only
++            case "gpu_feed": case "rumble": case "motion": case "ram_saver": case "draw_distance": case "textures": case "pipe_keep": return 0;   // text and facts only
              default: return 300;
 @@ -181,3 +181,3 @@ final class Diagram extends View {
          String res = value("render_res");
@@ -561,10 +729,10 @@ index b330096..ee5e01d 100644
          RectF scene = new RectF(x0, y0 + sh * (1 - k), x0 + sw * k, y0 + sh);
 diff --git a/games/totk/android/java/com/aure/totk/setup/GameReport.java b/games/totk/android/java/com/aure/totk/setup/GameReport.java
 new file mode 100644
-index 0000000..2714fb2
+index 0000000..145cf7e
 --- /dev/null
 +++ b/games/totk/android/java/com/aure/totk/setup/GameReport.java
-@@ -0,0 +1,134 @@
+@@ -0,0 +1,135 @@
 +package com.aure.totk.setup;
 +
 +import android.app.ActivityManager;
@@ -670,7 +838,8 @@ index 0000000..2714fb2
 +            for (String line; (line = in.readLine()) != null; ) {
 +                if (line.contains("mark mem1") || line.contains("mark ram-saver") || line.contains("memory image blocks")
 +                        || line.contains("memory: malloc") || line.contains("memory diag") || line.contains("mark smaps")
-+                        || line.contains("mark meminfo") || line.contains(" fps over the last 300")) {
++                        || line.contains("mark meminfo") || line.contains(" fps over the last 300")
++                        || line.contains("memory pools-use") || line.contains("[pipe-keep]")) {
 +                    if (first.size() < 20) { first.add(line); continue; }
 +                    if (keep.size() == 100) { keep.removeFirst(); skipped++; }
 +                    keep.addLast(line);
@@ -700,7 +869,7 @@ index 0000000..2714fb2
 +    }
 +}
 diff --git a/games/totk/android/java/com/aure/totk/setup/Settings.java b/games/totk/android/java/com/aure/totk/setup/Settings.java
-index 98f533d..6933e13 100644
+index 98f533d..87fe9b0 100644
 --- a/games/totk/android/java/com/aure/totk/setup/Settings.java
 +++ b/games/totk/android/java/com/aure/totk/setup/Settings.java
 @@ -37,3 +37,3 @@ final class Settings {
@@ -713,16 +882,17 @@ index 98f533d..6933e13 100644
 +        new Option("draw_distance", PICTURE, "game", "game", "4000", "2000", "1000"),
 +        new Option("textures", PICTURE, "full", "full", "half"),
          new Option("console_mode", SCREEN, "handheld", "handheld", "docked"),
-@@ -50,2 +52,3 @@ final class Settings {
+@@ -50,2 +52,4 @@ final class Settings {
          new Option("second_screen", SCREEN, "on", "off", "on"),
 +        new Option("ram_saver", SCREEN, "off", "off", "on", "max"),
++        new Option("pipe_keep", SCREEN, "off", "off", "2000", "1200"),
          new Option("buttons", CONTROLS, "nintendo", "nintendo", "xbox"),
-@@ -90,2 +93,4 @@ final class Settings {
+@@ -90,2 +94,4 @@ final class Settings {
          if (stored == null || !stored.containsKey("gpu_feed")) values.put("gpu_feed", gpuFeedDefault(soc));
 +        // RAM saver (S23 fork): a store without the key adopts the chip default; explicit choices win.
 +        if (stored == null || !stored.containsKey("ram_saver")) values.put("ram_saver", ramSaverDefault(soc));
      }
-@@ -190,2 +195,7 @@ final class Settings {
+@@ -190,2 +196,7 @@ final class Settings {
      }
 +    /** RAM saver default: On for phones with the Snapdragon 8 Gen 2 (SM8550: Galaxy S23 series and similar), whose
 +     * Android keeps far more running than a handheld; Off elsewhere (the AYN Thor reports QCS8550). */
@@ -730,17 +900,18 @@ index 98f533d..6933e13 100644
 +        return "SM8550".equals(socToken(soc)) ? "on" : "off";
 +    }
      /** Whether profile(soc) is backed by a device test (the "Recommended for this device" badge). */
-@@ -202,2 +212,3 @@ final class Settings {
+@@ -202,2 +213,3 @@ final class Settings {
          if (tab.equals(PERFORMANCE)) values.put("gpu_feed", gpuFeedDefault(soc));
 +        if (tab.equals(SCREEN)) values.put("ram_saver", ramSaverDefault(soc));
      }
-@@ -262,2 +273,5 @@ final class Settings {
+@@ -262,2 +274,6 @@ final class Settings {
          }
 +        // S23 fork: the render camera's far plane in metres (runtime/game_patches_v143.c); simulation is unchanged.
 +        if (!get("draw_distance").equals("game")) line(out, "TOTK_FAR_CLAMP=" + get("draw_distance"));
 +        if (get("textures").equals("half")) line(out, "TOTK_HALF_TEXTURES=1");
++        if (!get("pipe_keep").equals("off")) line(out, "TOTK_VK_PIPE_KEEP=" + get("pipe_keep"));
          line(out, "TOTK_OPERATION_MODE=" + get("console_mode"));
-@@ -267,2 +281,24 @@ final class Settings {
+@@ -267,2 +283,24 @@ final class Settings {
          line(out, "TOTK_COMPANION=" + (get("second_screen").equals("on") ? "1" : "0"));
 +        // RAM saver: caps only the app's own caches (texture-upload staging, preloaded shaders); the game's memory pool
 +        // is never reduced. TOTK_RAM_SAVER is read by RamGuard in the game process (live trims under memory pressure).
@@ -766,7 +937,7 @@ index 98f533d..6933e13 100644
 +        }
          line(out, "TOTK_FACE_BUTTONS=" + (get("buttons").equals("xbox") ? "position" : "label"));
 diff --git a/games/totk/android/java/com/aure/totk/setup/SetupActivity.java b/games/totk/android/java/com/aure/totk/setup/SetupActivity.java
-index c8e30d3..242b2b1 100644
+index c8e30d3..bd1762c 100644
 --- a/games/totk/android/java/com/aure/totk/setup/SetupActivity.java
 +++ b/games/totk/android/java/com/aure/totk/setup/SetupActivity.java
 @@ -1264,3 +1264,3 @@ public final class SetupActivity extends Activity implements SetupService.Listen
@@ -776,7 +947,7 @@ index c8e30d3..242b2b1 100644
              default:
 @@ -1268,2 +1268,3 @@ public final class SetupActivity extends Activity implements SetupService.Listen
                  if (SettingsStore.secondaryDisplay(this)) keys.add("second_screen");
-+                keys.add("ram_saver");
++                keys.add("ram_saver"); keys.add("pipe_keep");
          }
 @@ -1390,3 +1391,3 @@ public final class SetupActivity extends Activity implements SetupService.Listen
              case "gpu_feed": return value.equals("on") ? 1 : 0;
@@ -790,7 +961,7 @@ index c8e30d3..242b2b1 100644
              case "console_mode": return value.equals("docked") ? 4 : 2;
 @@ -1473,2 +1476,5 @@ public final class SetupActivity extends Activity implements SetupService.Listen
                      break;
-+                case "ram_saver": case "draw_distance": case "textures":
++                case "ram_saver": case "draw_distance": case "textures": case "pipe_keep":
 +                    fact(Strings.APPLIES, Strings.WHEN_STARTS);
 +                    break;
                  case "audio_latency":
@@ -837,7 +1008,7 @@ index c8e30d3..242b2b1 100644
 +
      /** The source commit this APK was built from: assets/build.txt ("commit <hash>", written by build_release.py). */
 diff --git a/games/totk/android/java/com/aure/totk/setup/Strings.java b/games/totk/android/java/com/aure/totk/setup/Strings.java
-index 6ce0578..3ad4e02 100644
+index 6ce0578..c2a8cf9 100644
 --- a/games/totk/android/java/com/aure/totk/setup/Strings.java
 +++ b/games/totk/android/java/com/aure/totk/setup/Strings.java
 @@ -138,2 +138,4 @@ final class Strings {
@@ -845,20 +1016,22 @@ index 6ce0578..3ad4e02 100644
 +            case "draw_distance": return "Draw distance";
 +            case "textures": return "Texture size";
              case "console_mode": return "Console mode";
-@@ -143,2 +145,3 @@ final class Strings {
+@@ -143,2 +145,4 @@ final class Strings {
              case "second_screen": return "Second screen";
 +            case "ram_saver": return "RAM saver";
++            case "pipe_keep": return "Pipeline limit";
              case "buttons": return "Button layout";
-@@ -162,2 +165,4 @@ final class Strings {
+@@ -162,2 +166,4 @@ final class Strings {
              case "shadows": return "Lower saves GPU time in busy areas";
 +            case "draw_distance": return "How far the world is drawn · fewer draws";
 +            case "textures": return "Half saves graphics memory · softer surfaces";
              case "console_mode": return "Docked uses the game's larger TV resolution";
-@@ -167,2 +172,3 @@ final class Strings {
+@@ -167,2 +173,4 @@ final class Strings {
              case "second_screen": return "Map, inventory and shortcuts on the lower display";
 +            case "ram_saver": return "Off · On · Max: smaller caches, fewer kills";
++            case "pipe_keep": return "Experimental · releases pipelines unused for a while";
              case "buttons": return "Which face button is the Switch's A";
-@@ -198,2 +204,8 @@ final class Strings {
+@@ -198,2 +206,8 @@ final class Strings {
                      + "textures sharper for a little more GPU time; Off is crispest but shows the steps.";
 +            case "textures": return "Half loads the game's textures from their second, smaller level: about a quarter of the graphics "
 +                    + "memory they take, so less is pushed out of RAM. Surfaces look softer up close. Text, menus and "
@@ -867,20 +1040,24 @@ index 6ce0578..3ad4e02 100644
 +                    + "which eases the processor (the usual limit on phones) and needs fewer graphics buffers. Distant land is "
 +                    + "cut at the horizon and far objects pop in later; what the game simulates is unchanged.";
              case "shadows": return "The resolution of the shadow maps. Lower saves GPU time where many shadows are on screen; their "
-@@ -207,2 +219,6 @@ final class Strings {
+@@ -207,2 +221,9 @@ final class Strings {
              case "overlay_pos": return "Which corner of the screen the performance overlay sits in.";
++            case "pipe_keep": return "Experimental. Caps how many prepared graphics pipelines stay in memory: the ones unused for the "
++                    + "longest are released and rebuilt from the cache the next time they are drawn (a few milliseconds each). "
++                    + "Saves memory in long sessions; may add short stutters when returning to places seen long ago.";
 +            case "ram_saver": return "Keeps the app's own caches small so Android is less likely to close the game or the apps "
 +                    + "behind it. On caps texture-upload staging and preloaded shaders; Max caps them harder, reads the game "
 +                    + "image from storage instead of mapping it and builds only the shaders a scene needs. While playing, if free RAM runs low, staging is trimmed further "
 +                    + "on its own. The game's own memory is never reduced. May add short stutters the first time new areas load.";
              case "second_screen": return "On handhelds with a second display, shows the map, inventory and shortcuts on it while you "
-@@ -229,2 +245,4 @@ final class Strings {
+@@ -229,2 +250,5 @@ final class Strings {
              case "upscaler": return upscalerName(value);
 +            case "draw_distance": return value.equals("game") ? "Game default" : (Integer.parseInt(value) / 1000) + " km";
 +            case "textures": return value.equals("half") ? "Half" : "Full";
++            case "pipe_keep": return value.equals("off") ? "Off" : value;
              case "aa": return value.equals("fxaa") ? "Game (FXAA)" : value.equals("smaa") ? "SMAA" : "Off";
 diff --git a/games/totk/runtime/frontend_android.c b/games/totk/runtime/frontend_android.c
-index ce1efe5..a5609d8 100644
+index ce1efe5..c6a434d 100644
 --- a/games/totk/runtime/frontend_android.c
 +++ b/games/totk/runtime/frontend_android.c
 @@ -1147,2 +1147,8 @@ static void log_start(void) {
@@ -897,10 +1074,10 @@ index ce1efe5..a5609d8 100644
 +    /* RAM saver (S23 fork): host-side caches only; the game's own 3.2 GiB pool is never reduced. */
 +    "TOTK_RAM_SAVER", "TOTK_VK_STAGING_RETAIN_MB", "TOTK_SEED_WARM_MB", "TOTK_ROMFS_MMAP", "TOTK_PSO_PREWARM",
 +    "TOTK_VK_REC_MEMORY_MB", "TOTK_VK_DESC_POOL_DIV", "TOTK_FAR_CLAMP",
-+    "TOTK_VK_RELEASE_BLOCKS", "TOTK_HALF_TEXTURES", "TOTK_VK_BLOCK_MB",
++    "TOTK_VK_RELEASE_BLOCKS", "TOTK_HALF_TEXTURES", "TOTK_VK_BLOCK_MB", "TOTK_VK_PIPE_KEEP",
  };
 diff --git a/tests/test_android_settings.py b/tests/test_android_settings.py
-index 006c426..6c04755 100644
+index 006c426..2cfaafc 100644
 --- a/tests/test_android_settings.py
 +++ b/tests/test_android_settings.py
 @@ -23,4 +23,14 @@ ALLOWED = {'TOTK_FPS60', 'TOTK_GPU_TIME', 'TOTK_FRAMEGEN', 'TOTK_REALTIME', 'TOT
@@ -909,7 +1086,7 @@ index 006c426..6c04755 100644
 +           'TOTK_UNCAPPED', 'TOTK_UNCAPPED_HZ', 'TOTK_UNCAPPED_INTERVAL', 'TOTK_FRAME_RATE_HINT', 'TOTK_FRAME_RATE_HINT_HZ',
 +           'TOTK_RAM_SAVER', 'TOTK_VK_STAGING_RETAIN_MB', 'TOTK_SEED_WARM_MB', 'TOTK_ROMFS_MMAP', 'TOTK_PSO_PREWARM',
 +           'TOTK_VK_REC_MEMORY_MB', 'TOTK_VK_DESC_POOL_DIV', 'TOTK_FAR_CLAMP',
-+           'TOTK_VK_RELEASE_BLOCKS', 'TOTK_HALF_TEXTURES', 'TOTK_VK_BLOCK_MB'}
++           'TOTK_VK_RELEASE_BLOCKS', 'TOTK_HALF_TEXTURES', 'TOTK_VK_BLOCK_MB', 'TOTK_VK_PIPE_KEEP'}
  FRONTEND = TOTK / 'runtime/frontend_android.c'
 +
 +
@@ -924,7 +1101,7 @@ index 006c426..6c04755 100644
 -                    self.assertEqual(self.run_probe(f'envsocpreset {preset} {soc} en-GB')[0].replace('|', '\n'), before)
 +                    self.assertEqual(self.run_probe(f'envsocpreset {preset} {soc} en-GB')[0].replace('|', '\n'), with_ram_saver(before, soc))
                  for feed in ('off', 'on'):
-@@ -263,2 +273,23 @@ class SettingsTests(unittest.TestCase):
+@@ -263,2 +273,25 @@ class SettingsTests(unittest.TestCase):
  
 +    def test_ram_saver_levels(self):
 +        self.assertFalse(any('RAM' in l or 'SEED' in l for l in self.env(soc='QCS8550')))
@@ -941,6 +1118,8 @@ index 006c426..6c04755 100644
 +        self.assertNotIn('TOTK_HALF_TEXTURES', self.env())
 +        self.assertIn('TOTK_HALF_TEXTURES=1', self.env(textures='half'))
 +        self.assertIn('TOTK_RENDER_RES=896x504', self.env(render_res='896x504'))
++        self.assertFalse(any(l.startswith('TOTK_VK_PIPE_KEEP') for l in self.env()))
++        self.assertIn('TOTK_VK_PIPE_KEEP=1200', self.env(pipe_keep='1200'))
 +
 +    def test_draw_distance(self):
 +        self.assertFalse(any(l.startswith('TOTK_FAR_CLAMP') for l in self.env()))
@@ -948,7 +1127,7 @@ index 006c426..6c04755 100644
 +            self.assertIn('TOTK_FAR_CLAMP=' + metres, self.env(draw_distance=metres))
 +
      def test_frame_lag_only_adds_one_line_to_odin_native_sixty_bytes(self):
-@@ -291,3 +322,3 @@ class SettingsTests(unittest.TestCase):
+@@ -291,3 +324,3 @@ class SettingsTests(unittest.TestCase):
                              actual = self.run_probe(f'envsoc {soc} en-GB frame_rate={rate} frame_gen={framegen} gpu_feed={feed}')[0].replace('|', '\n')
 -                            self.assertEqual(actual.encode(), expected.encode())
 +                            self.assertEqual(actual.encode(), with_ram_saver(expected, soc).encode())
