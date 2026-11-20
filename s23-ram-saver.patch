@@ -1,5 +1,5 @@
 diff --git a/games/totk/android/gfx/nvn_vk.c b/games/totk/android/gfx/nvn_vk.c
-index 956f3fb..de7fb97 100644
+index 956f3fb..9c8c571 100644
 --- a/games/totk/android/gfx/nvn_vk.c
 +++ b/games/totk/android/gfx/nvn_vk.c
 @@ -533,2 +533,5 @@ void vk_rec_profile_present(uint64_t frame) {
@@ -20,7 +20,18 @@ index 956f3fb..de7fb97 100644
      VKCHECK(vkCreateDevice(V.pd, &dci, NULL, &V.dev));
 +    vk_desc_pool_sizes_init();   /* S23 fork: TOTK_VK_DESC_POOL_DIV, before any layout or pool */
  #define DL(name) name = (PFN_##name)vkGetDeviceProcAddr(V.dev, #name);
-@@ -1056,3 +1062,21 @@ static uint64_t g_wb_alias_maps, g_wb_alias_bytes;   /* g_pool_mu; one mapping p
+@@ -1043,2 +1049,4 @@ typedef struct pool_ent {
+     int guest_unknown;            /* enabled: this guest mapping was replaced; owner buffer can still serve aliases */
++    int lazy, was_lazy;           /* S23 TOTK_VK_LAZY_POOLS: OWN without GPU memory yet (plain guest pages) / backed late */
++    uint64_t lazy_retry_ns;       /* put off (file reads in flight): not tried again before this */
+ #ifdef TOTK_VK_TESTS
+@@ -1054,5 +1062,27 @@ static uint64_t g_pool_bytes, g_pool_cpu;
+ static uint64_t g_wb_alias_maps, g_wb_alias_bytes;   /* g_pool_mu; one mapping per supported K_OWN */
++/* S23 fork, g_pool_mu: TOTK_VK_LAZY_POOLS (pools without GPU memory until the GPU first uses them) and
++   TOTK_POOL_PUNCH (the guest pages a pool's GPU memory is mapped over are handed back to the system). */
++static uint64_t g_lazy_n, g_lazy_bytes, g_lazy_promoted, g_lazy_promoted_bytes, g_lazy_failed, g_lazy_put_off, g_lazy_max_ns;
++static uint64_t g_punch_n, g_punch_bytes, g_punch_failed, g_punch_partial;
+ /* Address index for resolve(): GPU-backed spans sorted by start, plus elementary segments naming the furthest-reaching
     span. An early large pool kept the old prefix-max backscan linear; resolve_local was 10.6% of recording at Lookout Landing. */
 -typedef struct { uintptr_t lo, end; VkBuffer buf; uint64_t off; } span_t;   /* off: buffer offset of lo */
 +typedef struct { uintptr_t lo, end; VkBuffer buf; uint64_t off; uintptr_t ob; } span_t;   /* off: buffer offset of lo; ob: guest base of the buffer's own pool (S23 diagnostics) */
@@ -43,27 +54,226 @@ index 956f3fb..de7fb97 100644
 +    }
 +}
  typedef struct { uintptr_t lo; int best; } span_seg_t;   /* best covers [lo, next lo); the last breakpoint has no span */
-@@ -1707,3 +1731,3 @@ static void span_rebuild(void) {   /* caller holds g_pool_mu */
+@@ -1141,4 +1171,45 @@ static VkBuffer make_buffer(VkDeviceSize size, VkExternalMemoryHandleTypeFlags h
+ }
+-/* Give [base, end) its own device memory. 0 on failure (the pool then runs on the CPU path). */
+-static int back_pool(pool_ent *e) {
++static int lazy_on(void) {
++    static int on = -1;
++    if (on < 0) { const char *v = getenv("TOTK_VK_LAZY_POOLS"); on = v && !strcmp(v, "1") && g_pool_mode != POOLS_HOST;
++        if (on) LOGV("TOTK_VK_LAZY_POOLS=1: memory pools get GPU memory only when the GPU first uses them as buffers"); }
++    return on;
++}
++static int punch_on(void) {
++    static int on = -1;
++    if (on < 0) { const char *v = getenv("TOTK_POOL_PUNCH"); on = v && !strcmp(v, "1") && g_pool_mode != POOLS_HOST; }
++    return on;
++}
++extern int dm_guest_writes_block(int on) __attribute__((weak));   /* runtime/gfx_bridge.c */
++/* TOTK_POOL_PUNCH: which pages of dup (a second view, mremap old size 0, of the object behind base's first mapping) are
++   the very pages mapped at base: a byte changed through dup must show at base, and both must have agreed before. A
++   range can span objects (a pool given back earlier left a fresh object behind), and dup then shows other pages past
++   the first one. Writers are held off (registration, or the freeze). ok[i] per page; returns the matching count. */
++static size_t punch_check(volatile uint8_t *dup, volatile const uint8_t *base, size_t size, uint8_t *ok) {
++    size_t pg = page_sz(), n = 0;
++    for (size_t o = 0, i = 0; o < size; o += pg, i++) {
++        uint8_t d = dup[o], b = base[o];
++        dup[o] = (uint8_t)(d ^ 0x5a);
++        ok[i] = b == d && base[o] == (uint8_t)(d ^ 0x5a);
++        dup[o] = d;
++        n += ok[i];
++    }
++    return n;
++}
++static void punch_pages(uint8_t *dup, size_t size, const uint8_t *ok) {   /* MADV_REMOVE the matching runs */
++    size_t pg = page_sz(), np = size / pg;
++    for (size_t i = 0; i < np; ) {
++        if (!ok[i]) { i++; continue; }
++        size_t j = i; while (j < np && ok[j]) j++;
++        if (!madvise(dup + i * pg, (j - i) * pg, MADV_REMOVE)) { g_punch_bytes += (j - i) * pg; }
++        else { g_punch_failed++; static int said; if (!said++) LOGV("TOTK_POOL_PUNCH: MADV_REMOVE refused: %s", strerror(errno)); }
++        i = j;
++    }
++}
++/* Give [base, end) its own device memory. 0 on failure (the pool then runs on the CPU path). frozen (a pool already in
++   use, TOTK_VK_LAZY_POOLS): the copy and the remap happen with the guest range frozen read-only; failure is not fatal. */
++static int back_pool_ex(pool_ent *e, int frozen);
++static int back_pool(pool_ent *e) { return back_pool_ex(e, 0); }
++static int lazy_promote_locked(pool_ent *e);   /* S23 TOTK_VK_LAZY_POOLS, below */
++static int back_pool_ex(pool_ent *e, int frozen) {
+     size_t size = e->end - e->base;
+@@ -1181,7 +1252,37 @@ static int back_pool(pool_ent *e) {
+     void *tmp = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+-    if (tmp == MAP_FAILED) DIE("pool %#llx+%#zx: mapping the dma-buf: %s", (unsigned long long)e->base, size, strerror(errno));
++    if (tmp == MAP_FAILED) {
++        if (!frozen) DIE("pool %#llx+%#zx: mapping the dma-buf: %s", (unsigned long long)e->base, size, strerror(errno));
++        vkDestroyBuffer(g_dev, e->buf, NULL); vk_memory_release(e->mem, VK_MEMORY_POOL); close(fd); e->buf = VK_NULL_HANDLE; e->mem = VK_NULL_HANDLE; return 0;
++    }
++    /* S23 TOTK_POOL_PUNCH: the guest's memory is one shared object per reservation (runtime/services.c), so the pages
++       the dma-buf is mapped over would stay allocated, unreachable, in RAM or swap. A second view of them (mremap with
++       old size 0) is checked page by page (punch_check) and, after the remap, its matching pages are punched out with
++       MADV_REMOVE. Only at registration: the check briefly changes a byte per page, which game threads already using a
++       pool (a late, frozen promotion) could read. */
++    void *dup = punch_on() && !frozen ? mremap((void *)e->base, 0, size, MREMAP_MAYMOVE) : MAP_FAILED;
++    uint8_t *same = NULL;
++    if (punch_on() && !frozen && dup == MAP_FAILED) g_punch_failed++;
++    if (dup != MAP_FAILED && (mprotect(dup, size, PROT_READ | PROT_WRITE) || !(same = malloc(size / page_sz() + 1)))) { munmap(dup, size); dup = MAP_FAILED; g_punch_failed++; }
++    if (frozen) {
++        int ok = !dm_guest_writes_block || dm_guest_writes_block(1);
++        if (ok && !nvn_dirty_freeze_begin((void *)e->base, size)) { ok = 0; if (dm_guest_writes_block) dm_guest_writes_block(0); }
++        if (!ok) {
++            if (dup != MAP_FAILED) munmap(dup, size);
++            free(same);
++            munmap(tmp, size); vkDestroyBuffer(g_dev, e->buf, NULL); vk_memory_release(e->mem, VK_MEMORY_POOL); close(fd);
++            e->buf = VK_NULL_HANDLE; e->mem = VK_NULL_HANDLE; g_lazy_put_off++; return 0;
++        }
++    }
++    size_t matching = dup != MAP_FAILED ? punch_check(dup, (const uint8_t *)e->base, size, same) : 0;
+     memcpy(tmp, (void *)e->base, size);
+     mapping_forget(e->base, e->end);   /* MAP_FIXED failure may already have changed the old mapping */
+-    if (mmap((void *)e->base, size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0) != (void *)e->base)
++    if (mmap((void *)e->base, size, frozen ? PROT_READ : PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0) != (void *)e->base)
+         DIE("pool %#llx+%#zx: mapping the dma-buf at the guest address: %s", (unsigned long long)e->base, size, strerror(errno));
++    if (frozen) { nvn_dirty_freeze_end((void *)e->base, size); if (dm_guest_writes_block) dm_guest_writes_block(0); }
++    if (dup != MAP_FAILED) {   /* dup is writable (older kernels refuse MADV_REMOVE without write access) */
++        if (matching) { punch_pages(dup, size, same); g_punch_n++; }
++        if (matching < size / page_sz()) g_punch_partial++;
++        munmap(dup, size);
++    }
++    free(same);
+     if (g_wb_alias_enabled) {
+@@ -1194,2 +1295,3 @@ static void unback_pool(pool_ent *e) {
+     size_t size = e->end - e->base;
++    if (e->lazy) return;   /* never given GPU memory: the guest pages are still its own */
+     if (e->fd >= 0) {   /* contents back into ordinary shared memory, moved into place in one step */
+@@ -1242,3 +1344,4 @@ static void add_range(const void *mem, uint64_t size, int virt) {
+ #else
+-        e->kind = back_pool(e) ? K_OWN : K_CPU;
++        if (lazy_on()) { e->kind = K_OWN; e->lazy = 1; g_lazy_n++; g_lazy_bytes += e->end - e->base; }   /* S23: backed at first GPU use */
++        else e->kind = back_pool(e) ? K_OWN : K_CPU;
+ #endif
+@@ -1249,3 +1352,3 @@ static void add_range(const void *mem, uint64_t size, int virt) {
+     if (e->kind == K_CPU) { static int said; if (said++ < 8) LOGV("【红】pool %p+%#llx gets no GPU memory (overlaps another pool or allocation failed): its GPU work runs on the CPU", mem, (unsigned long long)size); g_pool_cpu++; }
+-    if (e->kind == K_OWN) g_pool_bytes += e->end - e->base;
++    if (e->kind == K_OWN && !e->lazy) g_pool_bytes += e->end - e->base;
+     pool_insert(e);
+@@ -1279,3 +1382,3 @@ static pool_ent *pool_remove_locked(const void *mem, int wait_gpu) {
+ #ifndef TOTK_VK_ALIAS_FIXTURE
+-        if (wait_gpu) vk_gpu_idle();
++        if (wait_gpu && !e->lazy) vk_gpu_idle();
+         HK_ADD(idle_pool, 1);
+@@ -1283,3 +1386,4 @@ static pool_ent *pool_remove_locked(const void *mem, int wait_gpu) {
+         unback_pool(e);
+-        g_pool_bytes -= e->end - e->base;
++        if (e->lazy) { g_lazy_n--; g_lazy_bytes -= e->end - e->base; }
++        else g_pool_bytes -= e->end - e->base;
+     }
+@@ -1507,2 +1611,3 @@ int mtl_vpool_replace(void *dst, const void *src, uint64_t size) {
+     pool_ent *owner = src ? mapped_source(src, size, &off) : NULL;
++    if (owner && owner->lazy) lazy_promote_locked(owner);   /* S23 TOTK_VK_LAZY_POOLS */
+     mapping_forget(va, va + size);
+@@ -1557,2 +1662,3 @@ int mtl_pool_alias(void *dst, const void *src, uint64_t size) {
+         own_containing((uintptr_t)src, (uintptr_t)src + size);
++    if (o && o->lazy) lazy_promote_locked(o);   /* S23: a virtual pool maps its pages: they must be the dma-buf's */
+     if (g_wb_alias_enabled) mapping_forget((uintptr_t)dst, (uintptr_t)dst + size);
+@@ -1707,3 +1813,3 @@ static void span_rebuild(void) {   /* caller holds g_pool_mu */
      g_nspan = 0;
 -    for (int i = 0; i < g_nalias; i++) { const alias_ent *x = &g_alias[i]; g_span[g_nspan++] = (span_t){x->va, x->end, x->owner->buf, x->off}; }
 +    for (int i = 0; i < g_nalias; i++) { const alias_ent *x = &g_alias[i]; g_span[g_nspan++] = (span_t){x->va, x->end, x->owner->buf, x->off, x->owner->base}; }
      for (int i = 0; i < g_npool; i++) {
-@@ -1711,4 +1735,4 @@ static void span_rebuild(void) {   /* caller holds g_pool_mu */
+@@ -1711,4 +1817,4 @@ static void span_rebuild(void) {   /* caller holds g_pool_mu */
          if (g_wb_alias_enabled && p->guest_unknown) continue;
 -        if (p->kind == K_OWN) g_span[g_nspan++] = (span_t){p->base, p->end, p->buf, 0};
 -        else if (p->kind == K_VIEW) g_span[g_nspan++] = (span_t){p->base, p->end, p->owner->buf, p->off};
-+        if (p->kind == K_OWN) g_span[g_nspan++] = (span_t){p->base, p->end, p->buf, 0, p->base};
-+        else if (p->kind == K_VIEW) g_span[g_nspan++] = (span_t){p->base, p->end, p->owner->buf, p->off, p->owner->base};
++        if (p->kind == K_OWN && !p->lazy) g_span[g_nspan++] = (span_t){p->base, p->end, p->buf, 0, p->base};
++        else if (p->kind == K_VIEW && !p->owner->lazy) g_span[g_nspan++] = (span_t){p->base, p->end, p->owner->buf, p->off, p->owner->base};
      }
-@@ -1783,2 +1807,3 @@ static int resolve_span(uint64_t addr, uint64_t len, VkBuffer *buf, uint64_t *of
+@@ -1775,4 +1881,4 @@ static int resolve_span(uint64_t addr, uint64_t len, VkBuffer *buf, uint64_t *of
+             if (a < p->base || b > p->end) continue;
+-            if (p->kind == K_OWN) { *buf = p->buf; *off = a - p->base; if (avail) *avail = p->end - a; return 1; }
+-            if (p->kind == K_VIEW) { *buf = p->owner->buf; *off = p->off + (a - p->base); if (avail) *avail = p->end - a; return 1; }
++            if (p->kind == K_OWN && !p->lazy) { *buf = p->buf; *off = a - p->base; if (avail) *avail = p->end - a; return 1; }
++            if (p->kind == K_VIEW && !p->owner->lazy) { *buf = p->owner->buf; *off = p->off + (a - p->base); if (avail) *avail = p->end - a; return 1; }
+         }
+@@ -1783,2 +1889,3 @@ static int resolve_span(uint64_t addr, uint64_t len, VkBuffer *buf, uint64_t *of
      if (!best) return 0;
 +    use_mark(best, a, b - a);
      *buf = best->buf; *off = best->off + (a - best->lo); if (avail) *avail = best->end - a;
-@@ -1832,2 +1857,3 @@ static int resolve_local(uint64_t addr, uint64_t len, VkBuffer *buf, uint64_t *o
+@@ -1813,3 +1920,69 @@ void vk_lookup_stats(uint64_t frame) {
+ }
++/* S23 TOTK_VK_LAZY_POOLS: the pool (or the pool a view lies in) holding a, still without GPU memory; *late when it was
++   given its memory late already (a lookup in an older copy of the index missed it). Caller holds g_pool_mu. */
++static pool_ent *lazy_owner_of(uintptr_t a, int *late) {
++    for (int i = 0; i < g_npool; i++) {
++        pool_ent *p = g_pools[i];
++        if (a < p->base || a >= p->end) continue;
++        pool_ent *o = p->kind == K_OWN ? p : p->kind == K_VIEW ? p->owner : NULL;
++        if (!o) continue;
++        if (o->lazy) return o;
++        if (o->was_lazy) *late = 1;
++    }
++    return NULL;
++}
++/* Give a lazy pool its GPU memory now: allocated, then the contents copied and the dma-buf mapped in place with the
++   range frozen (nvn_dirty_freeze_begin). Put off (0, still lazy) when file reads into guest memory do not finish in
++   time; an allocation failure leaves the pool on the CPU path, as at registration. Caller holds g_pool_mu. */
++static uint64_t lazy_clock_ns(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec; }
++static int lazy_promote_locked(pool_ent *e) {
++    if (!e->lazy) return 1;
++    uint64_t t0 = lazy_clock_ns(), put_off = g_lazy_put_off; size_t size = e->end - e->base;
++    if (t0 < e->lazy_retry_ns) return 0;
++    if (!back_pool_ex(e, 1)) {
++        if (g_lazy_put_off != put_off) { e->lazy_retry_ns = lazy_clock_ns() + 50000000ull; return 0; }
++        e->lazy = 0; e->kind = K_CPU; g_lazy_n--; g_lazy_bytes -= size; g_lazy_failed++; g_pool_cpu++;
++        for (int i = 0; i < g_npool; i++) if (g_pools[i]->owner == e) { g_pools[i]->kind = K_CPU; g_pools[i]->owner = NULL; }
++        RED(8, "on-demand pool %#llx+%#zx: no GPU memory (allocation failed): its GPU work runs on the CPU", (unsigned long long)e->base, size);
++        span_changed();
++        return 0;
++    }
++    e->lazy = 0; e->was_lazy = 1; g_lazy_n--; g_lazy_bytes -= size; g_pool_bytes += size;
++    g_lazy_promoted++; g_lazy_promoted_bytes += size;
++    atomic_fetch_add_explicit(&g_owner_gen, 1, memory_order_release);
++    span_changed();
++    uint64_t ns = lazy_clock_ns() - t0; if (ns > g_lazy_max_ns) g_lazy_max_ns = ns;
++    uint64_t n = g_lazy_promoted;
++    if (n <= 8 || !(n & (n - 1))) LOGV("on-demand pool %#llx+%#zx given GPU memory at its first GPU use in %.2f ms (%llu so far, %.1f MiB)",
++        (unsigned long long)e->base, size, ns / 1e6, (unsigned long long)n, g_lazy_promoted_bytes / 1048576.0);
++    return 1;
++}
++/* A lookup missed: 1 when the address lies in a pool that has GPU memory now (given just now, or earlier than the
++   index copy the lookup used), so the lookup is worth one retry. */
++static int lazy_retry(uint64_t addr) {
++    if (!lazy_on()) return 0;
++    /* Lookups that miss for memory outside every pool (CPU-side data) repeat: remember the page per index version. */
++    enum { NM = 64 };
++    static __thread struct { uint64_t page, gen; } miss[NM];
++    uint64_t page = addr >> 12, gen = atomic_load_explicit(&g_span_gen, memory_order_acquire);
++    unsigned h = (unsigned)(page ^ (page >> 6)) & (NM - 1);
++    if (miss[h].page == page && miss[h].gen == gen) return 0;
++    int late = 0, ok = 0;
++    pthread_mutex_lock(&g_pool_mu);
++    pool_ent *o = lazy_owner_of((uintptr_t)addr, &late);
++    if (o) ok = lazy_promote_locked(o);
++    uint64_t now_gen = atomic_load_explicit(&g_span_gen, memory_order_relaxed);
++    pthread_mutex_unlock(&g_pool_mu);
++    if (!ok && !late && !o) { miss[h].page = page; miss[h].gen = now_gen; }
++    return ok || late;
++}
++static __thread int t_lazy_retry;
++static int resolve_local_raw(uint64_t addr, uint64_t len, VkBuffer *buf, uint64_t *off, uint64_t *avail, int kind);
+ static int resolve_local(uint64_t addr, uint64_t len, VkBuffer *buf, uint64_t *off, uint64_t *avail, int kind) {
++    if (resolve_local_raw(addr, len, buf, off, avail, kind)) return 1;
++    if (t_lazy_retry || !lazy_retry(addr)) return 0;
++    t_lazy_retry = 1; int ok = resolve_local_raw(addr, len, buf, off, avail, kind); t_lazy_retry = 0;
++    return ok;
++}
++static int resolve_local_raw(uint64_t addr, uint64_t len, VkBuffer *buf, uint64_t *off, uint64_t *avail, int kind) {
+     uintptr_t a = (uintptr_t)addr, b = a + len;
+@@ -1832,2 +2005,3 @@ static int resolve_local(uint64_t addr, uint64_t len, VkBuffer *buf, uint64_t *o
      if (!best) return 0;
 +    use_mark(best, a, b - a);
      *buf = best->buf; *off = best->off + (a - best->lo); if (avail) *avail = best->end - a;
-@@ -1874,7 +1900,7 @@ const vk_record_spans *vk_record_spans_capture(unsigned slot) {
+@@ -1874,7 +2048,7 @@ const vk_record_spans *vk_record_spans_capture(unsigned slot) {
          s->span = VK_MALLOC((size_t)(g_nalias + g_npool) * sizeof *s->span);
 -        for (int i = 0; i < g_nalias; i++) { const alias_ent *a = &g_alias[i]; s->span[s->count++] = (span_t){a->va, a->end, a->owner->buf, a->off}; }
 +        for (int i = 0; i < g_nalias; i++) { const alias_ent *a = &g_alias[i]; s->span[s->count++] = (span_t){a->va, a->end, a->owner->buf, a->off, a->owner->base}; }
@@ -71,14 +281,16 @@ index 956f3fb..de7fb97 100644
              if (g_wb_alias_enabled && p->guest_unknown) continue;
 -            if (p->kind == K_OWN) s->span[s->count++] = (span_t){p->base, p->end, p->buf, 0};
 -            else if (p->kind == K_VIEW) s->span[s->count++] = (span_t){p->base, p->end, p->owner->buf, p->off};
-+            if (p->kind == K_OWN) s->span[s->count++] = (span_t){p->base, p->end, p->buf, 0, p->base};
-+            else if (p->kind == K_VIEW) s->span[s->count++] = (span_t){p->base, p->end, p->owner->buf, p->off, p->owner->base};
++            if (p->kind == K_OWN && !p->lazy) s->span[s->count++] = (span_t){p->base, p->end, p->buf, 0, p->base};
++            else if (p->kind == K_VIEW && !p->owner->lazy) s->span[s->count++] = (span_t){p->base, p->end, p->owner->buf, p->off, p->owner->base};
          }
-@@ -1916,2 +1942,3 @@ static int record_resolve_inner(const vk_record_spans *s, uint64_t a, uint64_t n
-     if (!best) return 0;
+@@ -1915,3 +2089,4 @@ static int record_resolve_inner(const vk_record_spans *s, uint64_t a, uint64_t n
+     else { unsigned h = (unsigned)((a >> 12) ^ (a >> 24)) & 63u; best = span_best(s->span, s->segment, s->segments, a, a + n, hints ? &hints[h] : NULL); }
+-    if (!best) return 0;
++    if (!best) return lazy_on() && !t_lazy_retry && lazy_retry(a) ? resolve_local(a, n, b, o, available, VK_LOOKUP_OTHER) : 0;   /* S23: backed after this snapshot */
 +    use_mark(best, a, n);
      *b = best->buf; *o = best->off + a - best->lo; if (available) *available = best->end - a; return 1;
-@@ -1951,2 +1978,23 @@ int mtl_addr(uint64_t addr, uint64_t len, void **buf, uint64_t *off) {
+@@ -1951,2 +2126,23 @@ int mtl_addr(uint64_t addr, uint64_t len, void **buf, uint64_t *off) {
  /* mtl_pool_invalidate: vk_res.c (GPU write-back of renderings into CPU-pool textures) */
 +/* S23 diagnostics: GPU-backed pool bytes the GPU has used as a buffer so far, and pools it never touched. */
 +static void pool_use_totals(uint64_t *used, uint64_t *unused, uint64_t *untouched_pools, uint64_t *untouched_bytes, uint64_t *outside) {
@@ -86,7 +298,7 @@ index 956f3fb..de7fb97 100644
 +    pthread_mutex_lock(&g_pool_mu);
 +    for (int i = 0; i < g_npool; i++) {
 +        const pool_ent *p = g_pools[i];
-+        if (p->kind != K_OWN) continue;
++        if (p->kind != K_OWN || p->lazy) continue;
 +        if (p->base < USE_BASE || p->end > USE_BASE + USE_SPAN) { *outside += p->end - p->base; continue; }
 +        uint64_t u = 0;
 +        for (uint64_t c = (p->base - USE_BASE) >> 16; c <= (p->end - 1 - USE_BASE) >> 16; c++) {
@@ -102,7 +314,7 @@ index 956f3fb..de7fb97 100644
 +    pthread_mutex_unlock(&g_pool_mu);
 +}
  void gpu_pool_totals(uint64_t *n, uint64_t *bytes) { pthread_mutex_lock(&g_pool_mu); *n = (uint64_t)g_npool; *bytes = g_pool_bytes; pthread_mutex_unlock(&g_pool_mu); }
-@@ -6527,4 +6575,29 @@ void vk_mem_report(void) {
+@@ -6527,4 +6723,37 @@ void vk_mem_report(void) {
      uint64_t r[8]; vk_res_mem(r);
 -    LOGV("memory image blocks: used/free %.3f/%.3f MiB (empty blocks retained for reuse)",
 -        r[7] / 1048576.0, (r[0] - r[7]) / 1048576.0);
@@ -132,6 +344,14 @@ index 956f3fb..de7fb97 100644
 +        LOGV("memory pools-use: GPU-backed pool bytes used by the GPU as buffers %llu MiB, never %llu MiB (64 KiB pieces); pools never touched %llu (%llu MiB); outside the tracked range %llu MiB",
 +             (unsigned long long)(used >> 20), (unsigned long long)(unused >> 20), (unsigned long long)upools,
 +             (unsigned long long)(ubytes >> 20), (unsigned long long)(outside >> 20));
++        pthread_mutex_lock(&g_pool_mu);
++        uint64_t ln = g_lazy_n, lb = g_lazy_bytes, lp = g_lazy_promoted, lpb = g_lazy_promoted_bytes, lo = g_lazy_put_off, lf = g_lazy_failed, lm = g_lazy_max_ns,
++                 pn = g_punch_n, pb = g_punch_bytes, pf = g_punch_failed, pp = g_punch_partial;
++        pthread_mutex_unlock(&g_pool_mu);
++        LOGV("memory pools-lazy: %s; without GPU memory %llu pools (%llu MiB), given it at first use %llu (%llu MiB), put off %llu, failed %llu, longest %.1f ms; guest pages under GPU memory freed in %llu pools (%llu MiB), refused %llu, partly other memory %llu (TOTK_POOL_PUNCH %s)",
++             lazy_on() ? "on demand (TOTK_VK_LAZY_POOLS=1)" : "all at registration", (unsigned long long)ln, (unsigned long long)(lb >> 20),
++             (unsigned long long)lp, (unsigned long long)(lpb >> 20), (unsigned long long)lo, (unsigned long long)lf, lm / 1e6,
++             (unsigned long long)pn, (unsigned long long)(pb >> 20), (unsigned long long)pf, (unsigned long long)pp, punch_on() ? "on" : "off");
 +    }
  #ifdef __GLIBC__
 diff --git a/games/totk/android/gfx/vk_draw.c b/games/totk/android/gfx/vk_draw.c
@@ -714,13 +934,13 @@ index 968cf89..3cf93f0 100644
 +        if (ramGuard != null) { ramGuard.close(); ramGuard = null; }
          if (feedback != null) { feedback.close(); feedback = null; }
 diff --git a/games/totk/android/java/com/aure/totk/setup/Diagram.java b/games/totk/android/java/com/aure/totk/setup/Diagram.java
-index b330096..1f365b4 100644
+index b330096..95877c9 100644
 --- a/games/totk/android/java/com/aure/totk/setup/Diagram.java
 +++ b/games/totk/android/java/com/aure/totk/setup/Diagram.java
 @@ -34,3 +34,3 @@ final class Diagram extends View {
              case "game_language": return 170;
 -            case "gpu_feed": case "rumble": case "motion": return 0;   // text and facts only
-+            case "gpu_feed": case "rumble": case "motion": case "ram_saver": case "draw_distance": case "textures": case "pipe_keep": return 0;   // text and facts only
++            case "gpu_feed": case "rumble": case "motion": case "ram_saver": case "draw_distance": case "textures": case "pipe_keep": case "gpu_pools": return 0;   // text and facts only
              default: return 300;
 @@ -181,3 +181,3 @@ final class Diagram extends View {
          String res = value("render_res");
@@ -729,10 +949,10 @@ index b330096..1f365b4 100644
          RectF scene = new RectF(x0, y0 + sh * (1 - k), x0 + sw * k, y0 + sh);
 diff --git a/games/totk/android/java/com/aure/totk/setup/GameReport.java b/games/totk/android/java/com/aure/totk/setup/GameReport.java
 new file mode 100644
-index 0000000..145cf7e
+index 0000000..fcf7598
 --- /dev/null
 +++ b/games/totk/android/java/com/aure/totk/setup/GameReport.java
-@@ -0,0 +1,135 @@
+@@ -0,0 +1,136 @@
 +package com.aure.totk.setup;
 +
 +import android.app.ActivityManager;
@@ -839,7 +1059,8 @@ index 0000000..145cf7e
 +                if (line.contains("mark mem1") || line.contains("mark ram-saver") || line.contains("memory image blocks")
 +                        || line.contains("memory: malloc") || line.contains("memory diag") || line.contains("mark smaps")
 +                        || line.contains("mark meminfo") || line.contains(" fps over the last 300")
-+                        || line.contains("memory pools-use") || line.contains("[pipe-keep]")) {
++                        || line.contains("memory pools-use") || line.contains("[pipe-keep]")
++                        || line.contains("memory pools-lazy") || line.contains("on-demand pool")) {
 +                    if (first.size() < 20) { first.add(line); continue; }
 +                    if (keep.size() == 100) { keep.removeFirst(); skipped++; }
 +                    keep.addLast(line);
@@ -869,7 +1090,7 @@ index 0000000..145cf7e
 +    }
 +}
 diff --git a/games/totk/android/java/com/aure/totk/setup/Settings.java b/games/totk/android/java/com/aure/totk/setup/Settings.java
-index 98f533d..87fe9b0 100644
+index 98f533d..ca3307f 100644
 --- a/games/totk/android/java/com/aure/totk/setup/Settings.java
 +++ b/games/totk/android/java/com/aure/totk/setup/Settings.java
 @@ -37,3 +37,3 @@ final class Settings {
@@ -882,17 +1103,18 @@ index 98f533d..87fe9b0 100644
 +        new Option("draw_distance", PICTURE, "game", "game", "4000", "2000", "1000"),
 +        new Option("textures", PICTURE, "full", "full", "half"),
          new Option("console_mode", SCREEN, "handheld", "handheld", "docked"),
-@@ -50,2 +52,4 @@ final class Settings {
+@@ -50,2 +52,5 @@ final class Settings {
          new Option("second_screen", SCREEN, "on", "off", "on"),
 +        new Option("ram_saver", SCREEN, "off", "off", "on", "max"),
 +        new Option("pipe_keep", SCREEN, "off", "off", "2000", "1200"),
++        new Option("gpu_pools", SCREEN, "start", "start", "demand"),
          new Option("buttons", CONTROLS, "nintendo", "nintendo", "xbox"),
-@@ -90,2 +94,4 @@ final class Settings {
+@@ -90,2 +95,4 @@ final class Settings {
          if (stored == null || !stored.containsKey("gpu_feed")) values.put("gpu_feed", gpuFeedDefault(soc));
 +        // RAM saver (S23 fork): a store without the key adopts the chip default; explicit choices win.
 +        if (stored == null || !stored.containsKey("ram_saver")) values.put("ram_saver", ramSaverDefault(soc));
      }
-@@ -190,2 +196,7 @@ final class Settings {
+@@ -190,2 +197,7 @@ final class Settings {
      }
 +    /** RAM saver default: On for phones with the Snapdragon 8 Gen 2 (SM8550: Galaxy S23 series and similar), whose
 +     * Android keeps far more running than a handheld; Off elsewhere (the AYN Thor reports QCS8550). */
@@ -900,18 +1122,20 @@ index 98f533d..87fe9b0 100644
 +        return "SM8550".equals(socToken(soc)) ? "on" : "off";
 +    }
      /** Whether profile(soc) is backed by a device test (the "Recommended for this device" badge). */
-@@ -202,2 +213,3 @@ final class Settings {
+@@ -202,2 +214,3 @@ final class Settings {
          if (tab.equals(PERFORMANCE)) values.put("gpu_feed", gpuFeedDefault(soc));
 +        if (tab.equals(SCREEN)) values.put("ram_saver", ramSaverDefault(soc));
      }
-@@ -262,2 +274,6 @@ final class Settings {
+@@ -262,2 +275,8 @@ final class Settings {
          }
 +        // S23 fork: the render camera's far plane in metres (runtime/game_patches_v143.c); simulation is unchanged.
 +        if (!get("draw_distance").equals("game")) line(out, "TOTK_FAR_CLAMP=" + get("draw_distance"));
 +        if (get("textures").equals("half")) line(out, "TOTK_HALF_TEXTURES=1");
 +        if (!get("pipe_keep").equals("off")) line(out, "TOTK_VK_PIPE_KEEP=" + get("pipe_keep"));
++        // S23 fork, experimental: game memory pools get GPU (unswappable) memory only when the GPU first uses them.
++        if (get("gpu_pools").equals("demand")) line(out, "TOTK_VK_LAZY_POOLS=1");
          line(out, "TOTK_OPERATION_MODE=" + get("console_mode"));
-@@ -267,2 +283,24 @@ final class Settings {
+@@ -267,2 +286,26 @@ final class Settings {
          line(out, "TOTK_COMPANION=" + (get("second_screen").equals("on") ? "1" : "0"));
 +        // RAM saver: caps only the app's own caches (texture-upload staging, preloaded shaders); the game's memory pool
 +        // is never reduced. TOTK_RAM_SAVER is read by RamGuard in the game process (live trims under memory pressure).
@@ -932,12 +1156,14 @@ index 98f533d..87fe9b0 100644
 +                line(out, "TOTK_VK_RELEASE_BLOCKS=1");
 +                // ... in 16 MiB blocks instead of 64, so less free space stays stranded in half-used ones.
 +                line(out, "TOTK_VK_BLOCK_MB=16");
++                // The game's pages that a pool's GPU memory is mapped over are handed back instead of staying allocated.
++                line(out, "TOTK_POOL_PUNCH=1");
 +                break;
 +            default: break;
 +        }
          line(out, "TOTK_FACE_BUTTONS=" + (get("buttons").equals("xbox") ? "position" : "label"));
 diff --git a/games/totk/android/java/com/aure/totk/setup/SetupActivity.java b/games/totk/android/java/com/aure/totk/setup/SetupActivity.java
-index c8e30d3..bd1762c 100644
+index c8e30d3..1927e5b 100644
 --- a/games/totk/android/java/com/aure/totk/setup/SetupActivity.java
 +++ b/games/totk/android/java/com/aure/totk/setup/SetupActivity.java
 @@ -1264,3 +1264,3 @@ public final class SetupActivity extends Activity implements SetupService.Listen
@@ -947,7 +1173,7 @@ index c8e30d3..bd1762c 100644
              default:
 @@ -1268,2 +1268,3 @@ public final class SetupActivity extends Activity implements SetupService.Listen
                  if (SettingsStore.secondaryDisplay(this)) keys.add("second_screen");
-+                keys.add("ram_saver"); keys.add("pipe_keep");
++                keys.add("ram_saver"); keys.add("pipe_keep"); keys.add("gpu_pools");
          }
 @@ -1390,3 +1391,3 @@ public final class SetupActivity extends Activity implements SetupService.Listen
              case "gpu_feed": return value.equals("on") ? 1 : 0;
@@ -961,7 +1187,7 @@ index c8e30d3..bd1762c 100644
              case "console_mode": return value.equals("docked") ? 4 : 2;
 @@ -1473,2 +1476,5 @@ public final class SetupActivity extends Activity implements SetupService.Listen
                      break;
-+                case "ram_saver": case "draw_distance": case "textures": case "pipe_keep":
++                case "ram_saver": case "draw_distance": case "textures": case "pipe_keep": case "gpu_pools":
 +                    fact(Strings.APPLIES, Strings.WHEN_STARTS);
 +                    break;
                  case "audio_latency":
@@ -1008,7 +1234,7 @@ index c8e30d3..bd1762c 100644
 +
      /** The source commit this APK was built from: assets/build.txt ("commit <hash>", written by build_release.py). */
 diff --git a/games/totk/android/java/com/aure/totk/setup/Strings.java b/games/totk/android/java/com/aure/totk/setup/Strings.java
-index 6ce0578..c2a8cf9 100644
+index 6ce0578..9d452ce 100644
 --- a/games/totk/android/java/com/aure/totk/setup/Strings.java
 +++ b/games/totk/android/java/com/aure/totk/setup/Strings.java
 @@ -138,2 +138,4 @@ final class Strings {
@@ -1016,22 +1242,24 @@ index 6ce0578..c2a8cf9 100644
 +            case "draw_distance": return "Draw distance";
 +            case "textures": return "Texture size";
              case "console_mode": return "Console mode";
-@@ -143,2 +145,4 @@ final class Strings {
+@@ -143,2 +145,5 @@ final class Strings {
              case "second_screen": return "Second screen";
 +            case "ram_saver": return "RAM saver";
 +            case "pipe_keep": return "Pipeline limit";
++            case "gpu_pools": return "GPU memory";
              case "buttons": return "Button layout";
-@@ -162,2 +166,4 @@ final class Strings {
+@@ -162,2 +167,4 @@ final class Strings {
              case "shadows": return "Lower saves GPU time in busy areas";
 +            case "draw_distance": return "How far the world is drawn · fewer draws";
 +            case "textures": return "Half saves graphics memory · softer surfaces";
              case "console_mode": return "Docked uses the game's larger TV resolution";
-@@ -167,2 +173,4 @@ final class Strings {
+@@ -167,2 +174,5 @@ final class Strings {
              case "second_screen": return "Map, inventory and shortcuts on the lower display";
 +            case "ram_saver": return "Off · On · Max: smaller caches, fewer kills";
 +            case "pipe_keep": return "Experimental · releases pipelines unused for a while";
++            case "gpu_pools": return "Experimental · On demand keeps unused game memory swappable";
              case "buttons": return "Which face button is the Switch's A";
-@@ -198,2 +206,8 @@ final class Strings {
+@@ -198,2 +208,8 @@ final class Strings {
                      + "textures sharper for a little more GPU time; Off is crispest but shows the steps.";
 +            case "textures": return "Half loads the game's textures from their second, smaller level: about a quarter of the graphics "
 +                    + "memory they take, so less is pushed out of RAM. Surfaces look softer up close. Text, menus and "
@@ -1040,24 +1268,29 @@ index 6ce0578..c2a8cf9 100644
 +                    + "which eases the processor (the usual limit on phones) and needs fewer graphics buffers. Distant land is "
 +                    + "cut at the horizon and far objects pop in later; what the game simulates is unchanged.";
              case "shadows": return "The resolution of the shadow maps. Lower saves GPU time where many shadows are on screen; their "
-@@ -207,2 +221,9 @@ final class Strings {
+@@ -207,2 +223,13 @@ final class Strings {
              case "overlay_pos": return "Which corner of the screen the performance overlay sits in.";
 +            case "pipe_keep": return "Experimental. Caps how many prepared graphics pipelines stay in memory: the ones unused for the "
 +                    + "longest are released and rebuilt from the cache the next time they are drawn (a few milliseconds each). "
 +                    + "Saves memory in long sessions; may add short stutters when returning to places seen long ago.";
++            case "gpu_pools": return "Experimental. The game's memory pools normally all become graphics memory at once, which Android "
++                    + "can neither compress nor swap; about 800 MB of it is never used by the GPU. On demand turns a pool into graphics "
++                    + "memory only the first time the GPU uses it, so the rest stays ordinary, swappable memory. May add a short "
++                    + "stutter when a pool is first used. If you see crashes or missing objects, set it back to At start.";
 +            case "ram_saver": return "Keeps the app's own caches small so Android is less likely to close the game or the apps "
 +                    + "behind it. On caps texture-upload staging and preloaded shaders; Max caps them harder, reads the game "
 +                    + "image from storage instead of mapping it and builds only the shaders a scene needs. While playing, if free RAM runs low, staging is trimmed further "
 +                    + "on its own. The game's own memory is never reduced. May add short stutters the first time new areas load.";
              case "second_screen": return "On handhelds with a second display, shows the map, inventory and shortcuts on it while you "
-@@ -229,2 +250,5 @@ final class Strings {
+@@ -229,2 +256,6 @@ final class Strings {
              case "upscaler": return upscalerName(value);
 +            case "draw_distance": return value.equals("game") ? "Game default" : (Integer.parseInt(value) / 1000) + " km";
 +            case "textures": return value.equals("half") ? "Half" : "Full";
 +            case "pipe_keep": return value.equals("off") ? "Off" : value;
++            case "gpu_pools": return value.equals("demand") ? "On demand" : "At start";
              case "aa": return value.equals("fxaa") ? "Game (FXAA)" : value.equals("smaa") ? "SMAA" : "Off";
 diff --git a/games/totk/runtime/frontend_android.c b/games/totk/runtime/frontend_android.c
-index ce1efe5..c6a434d 100644
+index ce1efe5..36ace27 100644
 --- a/games/totk/runtime/frontend_android.c
 +++ b/games/totk/runtime/frontend_android.c
 @@ -1147,2 +1147,8 @@ static void log_start(void) {
@@ -1069,24 +1302,224 @@ index ce1efe5..c6a434d 100644
 +        if (!stat(g_log_path, &st) && st.st_size > 256 * 1024) rename(g_log_path, prev);
 +    }
      g_log_fd = open(g_log_path, O_WRONLY | O_CREAT | O_TRUNC | O_APPEND | O_CLOEXEC, 0644);
-@@ -1268,2 +1274,6 @@ static const char *const settings_keys[] = {
+@@ -1268,2 +1274,7 @@ static const char *const settings_keys[] = {
      "TOTK_DATA_DIR",
 +    /* RAM saver (S23 fork): host-side caches only; the game's own 3.2 GiB pool is never reduced. */
 +    "TOTK_RAM_SAVER", "TOTK_VK_STAGING_RETAIN_MB", "TOTK_SEED_WARM_MB", "TOTK_ROMFS_MMAP", "TOTK_PSO_PREWARM",
 +    "TOTK_VK_REC_MEMORY_MB", "TOTK_VK_DESC_POOL_DIV", "TOTK_FAR_CLAMP",
 +    "TOTK_VK_RELEASE_BLOCKS", "TOTK_HALF_TEXTURES", "TOTK_VK_BLOCK_MB", "TOTK_VK_PIPE_KEEP",
++    "TOTK_VK_LAZY_POOLS", "TOTK_POOL_PUNCH",
  };
+diff --git a/games/totk/runtime/fs_host.c b/games/totk/runtime/fs_host.c
+index 4ea8f85..c1f3290 100644
+--- a/games/totk/runtime/fs_host.c
++++ b/games/totk/runtime/fs_host.c
+@@ -296,2 +296,4 @@ static unsigned read_file(uint64_t *out, uint64_t h, int64_t offset, void *buffe
+     if (!(mode & OPEN_READ)) return R_OPEN_MODE;
++    extern void dm_guest_write_section(int) __attribute__((weak));   /* S23 fork: TOTK_VK_LAZY_POOLS */
++    if (dm_guest_write_section) dm_guest_write_section(1);
+     dm_guest_write_prepare(buffer, (size_t)size);
+@@ -299,2 +301,3 @@ static unsigned read_file(uint64_t *out, uint64_t h, int64_t offset, void *buffe
+     while (done < size) { ssize_t n = pread(fd, (uint8_t *)buffer + done, (size_t)(size - done), offset + (off_t)done); if (n < 0) runtime_fail("host save read failure"); if (!n) break; done += (uint64_t)n; }
++    if (dm_guest_write_section) dm_guest_write_section(0);
+     *out = done; return 0;
+diff --git a/games/totk/runtime/gfx_bridge.c b/games/totk/runtime/gfx_bridge.c
+index 62132d8..b31b6b0 100644
+--- a/games/totk/runtime/gfx_bridge.c
++++ b/games/totk/runtime/gfx_bridge.c
+@@ -24,2 +24,24 @@ extern uint64_t dm_host_write_pc;   /* nvn_dirty.c: writer of a host write, for
+ void dm_guest_write_prepare(void *addr,size_t n){dm_host_write_pc=(uint64_t)__builtin_return_address(0);if(prepare_hook)prepare_hook(addr,n);}
++/* S23 fork (TOTK_VK_LAZY_POOLS): file reads straight into guest memory (pread: a read-only page there fails with EFAULT
++   instead of faulting) run as sections; a late GPU copy of a pool, which makes its range read-only for a moment, first
++   waits for the sections in flight (at most 200 ms, else it is put off) and holds new ones back until it is done. */
++#include <sched.h>
++#include <stdatomic.h>
++#include <time.h>
++static _Atomic int guest_write_sections,guest_write_blocked;
++void dm_guest_write_section(int begin){
++ if(!begin){atomic_fetch_sub(&guest_write_sections,1);return;}
++ for(;;){atomic_fetch_add(&guest_write_sections,1);if(!atomic_load(&guest_write_blocked))return;atomic_fetch_sub(&guest_write_sections,1);while(atomic_load(&guest_write_blocked))sched_yield();}
++}
++int dm_guest_writes_block(int on){
++ if(!on){atomic_store(&guest_write_blocked,0);return 1;}
++ atomic_store(&guest_write_blocked,1);
++ struct timespec t0,t;clock_gettime(CLOCK_MONOTONIC,&t0);
++ while(atomic_load(&guest_write_sections)){
++  clock_gettime(CLOCK_MONOTONIC,&t);
++  if((t.tv_sec-t0.tv_sec)*1000000000LL+(t.tv_nsec-t0.tv_nsec)>200000000LL){atomic_store(&guest_write_blocked,0);return 0;}
++  sched_yield();
++ }
++ return 1;
++}
+ /* TOTK diagnostic write watchpoint: TOTK_WATCH_ADDR=<hex guest address> [TOTK_WATCH_FRAME=<first frame>, default 300].
+diff --git a/games/totk/runtime/romfs.c b/games/totk/runtime/romfs.c
+index 1d65ddd..ce70b04 100644
+--- a/games/totk/runtime/romfs.c
++++ b/games/totk/runtime/romfs.c
+@@ -363,2 +363,4 @@ unsigned runtime_romfs_read(uint64_t *out,uint64_t h,int64_t offset,void *buffer
+  static _Atomic int profile_mode=-1;int profile=atomic_load(&profile_mode);if(profile<0){profile=getenv("TOTK_FS_TIMING")!=NULL;atomic_store(&profile_mode,profile);}uint64_t prep_start=profile?runtime_now_ns():0;
++ extern void dm_guest_write_section(int) __attribute__((weak));   /* S23 fork: TOTK_VK_LAZY_POOLS */
++ if(dm_guest_write_section)dm_guest_write_section(1);
+  dm_guest_write_prepare(buffer,(size_t)n);
+@@ -367,2 +369,3 @@ unsigned runtime_romfs_read(uint64_t *out,uint64_t h,int64_t offset,void *buffer
+  else while(done<n){size_t chunk=(size_t)(n-done);if(chunk>8<<20)chunk=8<<20;ssize_t r=src_pread(fd,(uint8_t *)buffer+done,chunk,(off_t)(base+(uint64_t)offset+done));if(r<=0)runtime_fail("RomFS read failure");done+=(uint64_t)r;}
++ if(dm_guest_write_section)dm_guest_write_section(0);
+  if(profile){uint64_t now=runtime_now_ns();atomic_fetch_add(&read_calls,1);atomic_fetch_add(&read_bytes,done);atomic_fetch_add(&read_ns,now-t0);atomic_fetch_add(&read_prepare_ns,t0-prep_start);
+diff --git a/games/totk/third_party/d2r_gfx/gfx/nvn/nvn_dirty.c b/games/totk/third_party/d2r_gfx/gfx/nvn/nvn_dirty.c
+index c6d45cd..5e85890 100644
+--- a/games/totk/third_party/d2r_gfx/gfx/nvn/nvn_dirty.c
++++ b/games/totk/third_party/d2r_gfx/gfx/nvn/nvn_dirty.c
+@@ -210,4 +210,28 @@ static void mp_account(uint64_t pages, uint64_t ticks, mp_stats_t *stats, nvn_di
+ }
++/* S23 fork (TOTK_VK_LAZY_POOLS): a pool that gets GPU memory late is copied into it while its guest range is frozen
++   read-only (nvn_dirty_freeze_begin/end). While a freeze covers a range, no permission change here may make it
++   writable (it would let a write slip past the copy), and guest writes that fault on it wait until it is over. */
++static _Atomic int g_frz_on, g_frz_writers;
++static _Atomic uintptr_t g_frz_lo, g_frz_hi, g_frz_last_lo, g_frz_last_hi;
++static _Atomic uint64_t g_frz_last_end;
++static inline int frz_covers(uintptr_t a, size_t n) {
++    if (!atomic_load(&g_frz_on)) return 0;
++    uintptr_t lo = atomic_load(&g_frz_lo), hi = atomic_load(&g_frz_hi);
++    return a < hi && a + (n ? n : 1) > lo;
++}
++static void frz_wait(uintptr_t a, size_t n) { while (frz_covers(a, n)) sched_yield(); }
++static void frz_enter(uintptr_t a, size_t n) {
++    for (;;) {
++        atomic_fetch_add(&g_frz_writers, 1);
++        if (!frz_covers(a, n)) return;
++        atomic_fetch_sub(&g_frz_writers, 1);
++        frz_wait(a, n);
++    }
++}
++static void frz_leave(void) { atomic_fetch_sub(&g_frz_writers, 1); }
++static int frz_recent(uintptr_t a);
+ static int mp_counted(uintptr_t a, size_t len, int prot, mp_stats_t *stats, nvn_dirty_mp_reason reason) {
++    int gate = prot & PROT_WRITE; if (gate) frz_enter(a, len);
+     uint64_t t = mach_absolute_time(); int ok = mprotect((void *)a, len, prot) == 0;
++    if (gate) frz_leave();
+     if (!ok && errno == ENOMEM && g_lag_enabled) vma_pressure();
+@@ -220,4 +244,6 @@ int nvn_dirty_mprotect(void *address, size_t size, int protection, nvn_dirty_mp_
+     int incoming_errno = errno; uint64_t start = mach_absolute_time();
++    int gate = protection & PROT_WRITE; if (gate) frz_enter((uintptr_t)address, size);
+     errno = incoming_errno;
+     int result = mprotect(address, size, protection), saved_errno = errno;
++    if (gate) frz_leave();
+     uint64_t ticks = mach_absolute_time() - start;
+@@ -1022,4 +1048,5 @@ static int on_fault(void *addr, int is_write, void *uc) {
+     (void)uc;
++    if (is_write && frz_covers((uintptr_t)addr, 1)) { frz_wait((uintptr_t)addr, 1); return 1; }   /* S23: frozen for a late GPU copy */
+     range_t *r = is_write ? find((uintptr_t)addr) : NULL;
+-    if (!r) return 0;
++    if (!r) return is_write && frz_recent((uintptr_t)addr);
+     uintptr_t p = ((uintptr_t)addr - r->base) >> g_shift;
+@@ -1036,3 +1063,3 @@ static int on_fault(void *addr, int is_write, void *uc) {
+     if (st >= PG_BUSY) return busy_wait(r, p);
+-    return atomic_load(&r->gen[p]) != 0;   // 刚被别的线程解掉（本次缺页发生在解之前）：重执行；从未保护过的页不是我们的 | Just unprotected by another thread (this fault happened before the unprotect): re-execute; pages that were never protected are not ours
++    return atomic_load(&r->gen[p]) != 0 || frz_recent((uintptr_t)addr);   // 刚被别的线程解掉（本次缺页发生在解之前）：重执行；从未保护过的页不是我们的 | Just unprotected by another thread (this fault happened before the unprotect): re-execute; pages that were never protected are not ours
+ }
+@@ -1040,2 +1067,3 @@ static void prep_write(void *addr, size_t len) {
+     uintptr_t a = (uintptr_t)addr, e = a + len;
++    frz_wait(a, len);   /* S23: a late GPU copy of this range is in progress */
+     while (len && a < e) {
+@@ -1903 +1931,75 @@ void nvn_dirty_mp_report(uint64_t frame) {
+ }
++
++/* ---------- S23 fork: freezing a guest range for a late GPU copy (TOTK_VK_LAZY_POOLS) ----------
++   begin: no writable permission change may start in [addr, addr+len) (mp gate), those in flight are waited out, then
++   the range becomes read-only: guest writes fault and wait in on_fault, host pre-writes wait in prep_write.
++   end (after the caller has replaced the mapping, read-only): every page whose state is NONE, and every page outside
++   the tracked ranges, becomes writable again; PROT pages stay read-only. Pages BUSY meanwhile belong to a protector
++   that finishes after the gate opens; they are settled in a second pass. For a short while afterwards a write fault
++   in the range that finds a writable-state page is retried rather than reported (it may predate the restore). */
++static int frz_recent(uintptr_t a) {
++    uintptr_t lo = atomic_load(&g_frz_last_lo), hi = atomic_load(&g_frz_last_hi);
++    if (a < lo || a >= hi || !g_tb.denom) return 0;
++    uint64_t end = atomic_load(&g_frz_last_end);
++    return !end || (mach_absolute_time() - end) * g_tb.numer / g_tb.denom < 250000000ull;
++}
++int nvn_dirty_freeze_begin(void *addr, size_t len) {
++    if (!g_tb.denom) mach_timebase_info(&g_tb);
++    if (!g_pg) { g_pg = (uintptr_t)getpagesize(); g_shift = __builtin_ctzl(g_pg); }
++    uintptr_t lo = (uintptr_t)addr, hi = lo + len;
++    atomic_store(&g_frz_lo, lo); atomic_store(&g_frz_hi, hi);
++    atomic_store(&g_frz_last_end, 0); atomic_store(&g_frz_last_lo, lo); atomic_store(&g_frz_last_hi, hi);
++    atomic_store(&g_frz_on, 1);
++    while (atomic_load(&g_frz_writers)) sched_yield();
++    if (mprotect(addr, len, PROT_READ)) { int e = errno; atomic_store(&g_frz_on, 0); atomic_store(&g_frz_last_end, mach_absolute_time()); errno = e; return 0; }
++    return 1;
++}
++static uintptr_t frz_next_range(uintptr_t a, uintptr_t hi) {   /* start of the next live range after a, or hi */
++    uintptr_t next = hi; int n = atomic_load_explicit(&g_nr, memory_order_acquire);
++    for (int i = 0; i < n; i++) {
++        if (!atomic_load_explicit(&g_r[i].live, memory_order_acquire)) continue;
++        uintptr_t b = __atomic_load_n(&g_r[i].base, __ATOMIC_RELAXED);
++        if (b > a && b < next) next = b;
++    }
++    return next;
++}
++/* One pass: NONE pages (CAS to BUSY first, as every protector does) and untracked gaps writable. Returns 1 if any page
++   of a tracked range was BUSY (wait_busy 0) and a second pass is needed. */
++static int frz_restore(uintptr_t lo, uintptr_t hi, int wait_busy) {
++    int busy = 0;
++    for (uintptr_t a = lo; a < hi; ) {
++        range_t *r = find_range(a, 0);
++        if (!r || !range_has(r, a)) {
++            uintptr_t next = frz_next_range(a, hi);
++            if (!wait_busy) mprotect((void *)a, next - a, PROT_READ | PROT_WRITE);
++            a = next; continue;
++        }
++        uintptr_t stop = hi < r->end ? hi : r->end;
++        uintptr_t p0 = (a - r->base) >> g_shift, p1 = (stop - r->base + g_pg - 1) >> g_shift, run = 0; int open = 0;
++        for (uintptr_t i = p0; i <= p1; i++) {
++            int took = 0;
++            if (i < p1) {
++                if (wait_busy && atomic_load(&r->state[i]) >= PG_BUSY) busy_wait(r, i);
++                uint8_t st = PG_NONE;
++                took = atomic_compare_exchange_strong(&r->state[i], &st, PG_BUSY);
++                if (!took && st >= PG_BUSY) busy = 1;
++            }
++            if (took && !open) { run = i; open = 1; }
++            if (!took && open) {
++                mprotect((void *)(r->base + (run << g_shift)), (i - run) << g_shift, PROT_READ | PROT_WRITE);
++                for (uintptr_t k = run; k < i; k++) atomic_store(&r->state[k], PG_NONE);
++                open = 0;
++            }
++        }
++        a = stop;
++    }
++    return busy;
++}
++void nvn_dirty_freeze_end(void *addr, size_t len) {
++    uintptr_t lo = (uintptr_t)addr, hi = lo + len;
++    int busy = frz_restore(lo, hi, 0);
++    atomic_store(&g_frz_last_end, 0);
++    atomic_store(&g_frz_on, 0);   /* protectors held at the gate go on now */
++    if (busy) frz_restore(lo, hi, 1);
++    atomic_store(&g_frz_last_end, mach_absolute_time());
++}
+diff --git a/games/totk/third_party/d2r_gfx/gfx/nvn/nvn_dirty.h b/games/totk/third_party/d2r_gfx/gfx/nvn/nvn_dirty.h
+index 9211ffc..3d8d11e 100644
+--- a/games/totk/third_party/d2r_gfx/gfx/nvn/nvn_dirty.h
++++ b/games/totk/third_party/d2r_gfx/gfx/nvn/nvn_dirty.h
+@@ -174,2 +174,6 @@ void nvn_dirty_mp_report(uint64_t frame); /* existing 300-frame reporter; never
+ int nvn_dirty_mprotect(void *address, size_t size, int protection, nvn_dirty_mp_reason reason);
++/* S23 fork (TOTK_VK_LAZY_POOLS): freeze a guest range read-only while it is copied into GPU memory and remapped
++   (read-only) at the same address; end restores the permissions the tracker's page states call for. Not signal-safe. */
++int nvn_dirty_freeze_begin(void *addr, size_t len);
++void nvn_dirty_freeze_end(void *addr, size_t len);
+ void nvn_dirty_slot_stats(int *live, int *used_slots, uint64_t *adds_total); // 当前存活槽、槽表高水位、登记总次数 | Currently live slots, slot table high-water mark, total number of registrations
 diff --git a/tests/test_android_settings.py b/tests/test_android_settings.py
-index 006c426..2cfaafc 100644
+index 006c426..2638f75 100644
 --- a/tests/test_android_settings.py
 +++ b/tests/test_android_settings.py
-@@ -23,4 +23,14 @@ ALLOWED = {'TOTK_FPS60', 'TOTK_GPU_TIME', 'TOTK_FRAMEGEN', 'TOTK_REALTIME', 'TOT
+@@ -23,4 +23,15 @@ ALLOWED = {'TOTK_FPS60', 'TOTK_GPU_TIME', 'TOTK_FRAMEGEN', 'TOTK_REALTIME', 'TOT
             'TOTK_AUTOLOAD', 'TOTK_VK_SPLIT_PASS_DRAWS', 'TOTK_ADPF_GPU', 'TOTK_FPS60_HYSTERESIS',
 -           'TOTK_UNCAPPED', 'TOTK_UNCAPPED_HZ', 'TOTK_UNCAPPED_INTERVAL', 'TOTK_FRAME_RATE_HINT', 'TOTK_FRAME_RATE_HINT_HZ'}
 +           'TOTK_UNCAPPED', 'TOTK_UNCAPPED_HZ', 'TOTK_UNCAPPED_INTERVAL', 'TOTK_FRAME_RATE_HINT', 'TOTK_FRAME_RATE_HINT_HZ',
 +           'TOTK_RAM_SAVER', 'TOTK_VK_STAGING_RETAIN_MB', 'TOTK_SEED_WARM_MB', 'TOTK_ROMFS_MMAP', 'TOTK_PSO_PREWARM',
 +           'TOTK_VK_REC_MEMORY_MB', 'TOTK_VK_DESC_POOL_DIV', 'TOTK_FAR_CLAMP',
-+           'TOTK_VK_RELEASE_BLOCKS', 'TOTK_HALF_TEXTURES', 'TOTK_VK_BLOCK_MB', 'TOTK_VK_PIPE_KEEP'}
++           'TOTK_VK_RELEASE_BLOCKS', 'TOTK_HALF_TEXTURES', 'TOTK_VK_BLOCK_MB', 'TOTK_VK_PIPE_KEEP',
++           'TOTK_VK_LAZY_POOLS', 'TOTK_POOL_PUNCH'}
  FRONTEND = TOTK / 'runtime/frontend_android.c'
 +
 +
@@ -1096,12 +1529,12 @@ index 006c426..2cfaafc 100644
 +        return env
 +    return env.replace('TOTK_COMPANION=1\n', 'TOTK_COMPANION=1\nTOTK_RAM_SAVER=on\nTOTK_VK_STAGING_RETAIN_MB=96\nTOTK_SEED_WARM_MB=48\n')
  FRAMEGEN = ['TOTK_FPS60=0', 'TOTK_FRAMEGEN=locked', 'TOTK_REALTIME=1', 'TOTK_FRAME_LAG=0', 'TOTK_FPS_AUTO=0', 'DM_PRESENT_HZ=60',
-@@ -224,3 +234,3 @@ class SettingsTests(unittest.TestCase):
+@@ -224,3 +235,3 @@ class SettingsTests(unittest.TestCase):
                  for soc in ('QCS8550', 'QCM8550', 'SM8550', 'CQ7790S', 'CQ7790M', 'SM7750', 'unknown', 'SM8650', 'XSM8750', 'CQ8725SA'):
 -                    self.assertEqual(self.run_probe(f'envsocpreset {preset} {soc} en-GB')[0].replace('|', '\n'), before)
 +                    self.assertEqual(self.run_probe(f'envsocpreset {preset} {soc} en-GB')[0].replace('|', '\n'), with_ram_saver(before, soc))
                  for feed in ('off', 'on'):
-@@ -263,2 +273,25 @@ class SettingsTests(unittest.TestCase):
+@@ -263,2 +274,27 @@ class SettingsTests(unittest.TestCase):
  
 +    def test_ram_saver_levels(self):
 +        self.assertFalse(any('RAM' in l or 'SEED' in l for l in self.env(soc='QCS8550')))
@@ -1109,7 +1542,7 @@ index 006c426..2cfaafc 100644
 +        on = self.env(ram_saver='on')
 +        self.assertIn('TOTK_RAM_SAVER=on', on); self.assertIn('TOTK_VK_STAGING_RETAIN_MB=96', on); self.assertIn('TOTK_SEED_WARM_MB=48', on)
 +        mx = self.env(ram_saver='max')
-+        for line in ('TOTK_RAM_SAVER=max', 'TOTK_VK_STAGING_RETAIN_MB=32', 'TOTK_SEED_WARM_MB=16', 'TOTK_ROMFS_MMAP=0', 'TOTK_PSO_PREWARM=0', 'TOTK_VK_REC_MEMORY_MB=16', 'TOTK_VK_DESC_POOL_DIV=4', 'TOTK_VK_RELEASE_BLOCKS=1', 'TOTK_VK_BLOCK_MB=16'):
++        for line in ('TOTK_RAM_SAVER=max', 'TOTK_VK_STAGING_RETAIN_MB=32', 'TOTK_SEED_WARM_MB=16', 'TOTK_ROMFS_MMAP=0', 'TOTK_PSO_PREWARM=0', 'TOTK_VK_REC_MEMORY_MB=16', 'TOTK_VK_DESC_POOL_DIV=4', 'TOTK_VK_RELEASE_BLOCKS=1', 'TOTK_VK_BLOCK_MB=16', 'TOTK_POOL_PUNCH=1'):
 +            self.assertIn(line, mx)
 +        self.assertIn('TOTK_RAM_SAVER=on', self.env(soc='SM8550'))
 +        self.assertNotIn('TOTK_RAM_SAVER=on', self.env(soc='SM8550', ram_saver='off'))
@@ -1120,6 +1553,8 @@ index 006c426..2cfaafc 100644
 +        self.assertIn('TOTK_RENDER_RES=896x504', self.env(render_res='896x504'))
 +        self.assertFalse(any(l.startswith('TOTK_VK_PIPE_KEEP') for l in self.env()))
 +        self.assertIn('TOTK_VK_PIPE_KEEP=1200', self.env(pipe_keep='1200'))
++        self.assertFalse(any(l.startswith('TOTK_VK_LAZY_POOLS') for l in self.env()))
++        self.assertIn('TOTK_VK_LAZY_POOLS=1', self.env(gpu_pools='demand'))
 +
 +    def test_draw_distance(self):
 +        self.assertFalse(any(l.startswith('TOTK_FAR_CLAMP') for l in self.env()))
@@ -1127,7 +1562,7 @@ index 006c426..2cfaafc 100644
 +            self.assertIn('TOTK_FAR_CLAMP=' + metres, self.env(draw_distance=metres))
 +
      def test_frame_lag_only_adds_one_line_to_odin_native_sixty_bytes(self):
-@@ -291,3 +324,3 @@ class SettingsTests(unittest.TestCase):
+@@ -291,3 +327,3 @@ class SettingsTests(unittest.TestCase):
                              actual = self.run_probe(f'envsoc {soc} en-GB frame_rate={rate} frame_gen={framegen} gpu_feed={feed}')[0].replace('|', '\n')
 -                            self.assertEqual(actual.encode(), expected.encode())
 +                            self.assertEqual(actual.encode(), with_ram_saver(expected, soc).encode())
